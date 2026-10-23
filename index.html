@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>多周期K线联动</title>
+<!--
+  多周期K线联动看盘(币安USDT永续合约,只读公开行情,不需要API Key)
+  - 三个窗口同一个合约、不同周期(默认 1小时/15分钟/5分钟,每个窗口可单独改)
+  - 拖动/缩放任何一个窗口,另外两个自动滚到同一时间(各自保持自己的缩放)
+  - 十字光标同步: 鼠标指到某根K线,另外两个窗口同一时刻也显示竖线
+  - 往左拖到头会自动加载更早的K线; 最新K线走币安WebSocket实时更新
+  用法: 直接双击用浏览器打开; 也可以带参数 mtf_chart.html?symbol=ain
+  注意: 跟其他脚本一样,需要能访问 fapi.binance.com(VPN开着)
+-->
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{--bg:#0b0e11;--panel:#161a1e;--grid:#1f2429;--line:#2b3139;--text:#eaecef;--muted:#848e9c;--up:#0ecb81;--down:#f6465d;--accent:#f0b90b}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:13px -apple-system,"PingFang SC",sans-serif}
+body{display:flex;flex-direction:column}
+header{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header b{color:var(--accent);font-size:15px;margin-right:4px}
+input,select,button{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:4px;padding:4px 8px;font:inherit}
+input{width:130px;text-transform:uppercase}
+button{cursor:pointer}
+button:hover,select:hover{border-color:var(--muted)}
+a{color:var(--muted);text-decoration:none}
+a:hover{color:var(--accent)}
+#status{color:var(--muted)}
+#status.err{color:var(--down)}
+.links{margin-left:auto;display:flex;gap:12px}
+#grid{flex:1;display:grid;gap:4px;padding:4px;min-height:0}
+#grid.cols{grid-template-columns:repeat(3,minmax(0,1fr))}
+#grid.rows{grid-template-rows:repeat(3,minmax(0,1fr))}
+.pane{background:var(--panel);border:1px solid var(--line);min-height:0;min-width:0;display:flex;flex-direction:column}
+.pane.active{border-color:#4a4f57}
+.pane .bar{display:flex;gap:8px;align-items:center;padding:4px 6px;border-bottom:1px solid var(--line)}
+.pane .bar select{padding:2px 4px}
+.legend{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.legend .up{color:var(--up)}.legend .down{color:var(--down)}
+.pane .chart{flex:1;min-height:0;position:relative}
+.band{position:absolute;top:0;display:none;pointer-events:none;z-index:3;background:rgba(240,185,11,.13);border-left:1px solid rgba(240,185,11,.6);border-right:1px solid rgba(240,185,11,.6)}
+@media (max-width:900px){#grid.cols{grid-template-columns:minmax(0,1fr);grid-template-rows:repeat(3,minmax(260px,1fr))}#grid{overflow:auto}}
+</style>
+</head>
+<body>
+<header>
+  <b>多周期联动</b>
+  <input id="sym" placeholder="合约,如 AIN" autocomplete="off">
+  <button id="go">打开</button>
+  <button id="layout">竖排</button>
+  <button id="latest">回到最新</button>
+  <button id="scale">对数坐标</button>
+  <span id="status"></span>
+  <span class="links">
+    <a id="lnk-tf" target="_blank">TradeFlow</a>
+    <a id="lnk-cg" target="_blank">CoinGlass</a>
+    <a id="lnk-tv" target="_blank">TradingView</a>
+  </span>
+</header>
+<div id="grid" class="cols"></div>
+
+<script>
+const API = 'https://fapi.binance.com';
+const WS = 'wss://fstream.binance.com/stream?streams=';
+const TZ = -new Date().getTimezoneOffset() * 60;   // 图表库按UTC显示,整体平移成本地时间
+const SEC = {'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'12h':43200,'1d':86400};
+const LABEL = {'1m':'1分钟','3m':'3分钟','5m':'5分钟','15m':'15分钟','30m':'30分钟','1h':'1小时','2h':'2小时','4h':'4小时','6h':'6小时','12h':'12小时','1d':'1天'};
+const PAGE = 1500;          // 币安一次最多给1500根
+const MAX_PAGES = 40;       // 为了对齐时间最多往前补多少页
+const INIT_BARS = 200;      // 打开时每个窗口显示多少根
+const RIGHT_PAD = 5;
+
+const $ = id => document.getElementById(id);
+let symbol = '', panes = [], active = null, ws = null, pxFmt = null, mouseDown = false;
+let logScale = true;   // 价格轴默认用对数坐标
+addEventListener('pointerdown', () => { mouseDown = true; }, true);
+addEventListener('pointerup', () => { mouseDown = false; }, true);
+addEventListener('pointercancel', () => { mouseDown = false; }, true);
+let lastWheel = 0;
+addEventListener('wheel', () => { lastWheel = Date.now(); }, {capture: true, passive: true});
+// 只有用户真的在拖动/滚轮缩放时才带着别的窗口滚; 实时推价、加载更早数据引起的画面变化不联动,
+// 否则会把别的窗口从"对准光标"的位置拉走
+const userMoving = () => mouseDown || Date.now() - lastWheel < 400;
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('mtf_' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('mtf_' + k, JSON.stringify(v)); } catch {} },
+};
+
+function normSym(s) {
+  s = (s || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!s) return '';
+  return s.endsWith('USDT') ? s : s + 'USDT';
+}
+function setStatus(t, err) { $('status').textContent = t; $('status').className = err ? 'err' : ''; }
+
+function toBar(k) {
+  return {time: Math.floor(k[0] / 1000) + TZ, open: +k[1], high: +k[2], low: +k[3], close: +k[4], value: +k[7]};
+}
+async function fetchKlines(iv, endTime) {
+  const p = new URLSearchParams({symbol, interval: iv, limit: PAGE});
+  if (endTime) p.set('endTime', endTime);
+  const r = await fetch(`${API}/fapi/v1/klines?${p}`);
+  if (!r.ok) throw new Error((await r.text()).slice(0, 150));
+  return (await r.json()).map(toBar);
+}
+
+function makePxFmt(price) {
+  const prec = Math.min(10, Math.max(2, 4 - Math.floor(Math.log10(Math.abs(price) || 1))));
+  return {type: 'price', precision: prec, minMove: Math.pow(10, -prec)};
+}
+function fmtVol(v) {
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  return v.toFixed(0);
+}
+function fmtTime(t) {
+  const d = new Date((t - TZ) * 1000), z = n => String(n).padStart(2, '0');
+  return `${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`;
+}
+
+class Pane {
+  constructor(iv, idx) {
+    this.iv = iv; this.idx = idx; this.bars = []; this.loading = false; this.exhausted = false; this.pendingT = null;
+    this.el = document.createElement('div');
+    this.el.className = 'pane';
+    this.el.innerHTML = `<div class="bar"><select>${Object.keys(SEC).map(k =>
+      `<option value="${k}"${k === iv ? ' selected' : ''}>${LABEL[k]}</option>`).join('')}</select>
+      <span class="legend"></span></div><div class="chart"></div>`;
+    $('grid').appendChild(this.el);
+    this.legendEl = this.el.querySelector('.legend');
+    this.el.querySelector('select').onchange = e => this.changeInterval(e.target.value);
+    // 鼠标/手指在哪个窗口上,哪个窗口就是"带头"的,其他窗口跟着它走
+    const activate = () => { if (active !== this) { active && active.el.classList.remove('active'); active = this; this.el.classList.add('active'); } };
+    this.el.addEventListener('pointerenter', activate);
+    this.el.addEventListener('pointerdown', activate);
+    this.el.addEventListener('wheel', activate, {passive: true});
+
+    const box = this.el.querySelector('.chart');
+    this.bandEl = document.createElement('div');
+    this.bandEl.className = 'band';
+    box.appendChild(this.bandEl);
+    this.band = null;
+    this.chart = LightweightCharts.createChart(box, {
+      autoSize: true,
+      layout: {background: {color: '#161a1e'}, textColor: '#848e9c'},
+      grid: {vertLines: {color: '#1f2429'}, horzLines: {color: '#1f2429'}},
+      crosshair: {mode: LightweightCharts.CrosshairMode.Normal,
+                  vertLine: {color: '#aab2bd', labelBackgroundColor: '#5e6673'},
+                  horzLine: {color: '#6b7380', labelBackgroundColor: '#5e6673'}},
+      rightPriceScale: {borderColor: '#2b3139', scaleMargins: {top: 0.06, bottom: 0.24}, mode: scaleMode()},
+      timeScale: {borderColor: '#2b3139', timeVisible: true, secondsVisible: false, rightOffset: RIGHT_PAD},
+    });
+    this.ts = this.chart.timeScale();
+    this.candle = this.chart.addCandlestickSeries({
+      upColor: '#0ecb81', downColor: '#f6465d', borderVisible: false, wickUpColor: '#0ecb81', wickDownColor: '#f6465d'});
+    this.vol = this.chart.addHistogramSeries({priceFormat: {type: 'volume'}, priceScaleId: '', lastValueVisible: false, priceLineVisible: false});
+    this.vol.priceScale().applyOptions({scaleMargins: {top: 0.8, bottom: 0}});
+
+    this.ts.subscribeVisibleLogicalRangeChange(lr => this.onRange(lr));
+    this.chart.subscribeCrosshairMove(p => this.onCross(p));
+  }
+
+  get sec() { return SEC[this.iv]; }
+
+  volBar(b) { return {time: b.time, value: b.value, color: b.close >= b.open ? 'rgba(14,203,129,.35)' : 'rgba(246,70,93,.35)'}; }
+  applyData() {
+    this.candle.setData(this.bars);
+    this.vol.setData(this.bars.map(b => this.volBar(b)));
+  }
+
+  async load() {
+    this.exhausted = false;
+    this.bars = await fetchKlines(this.iv);
+    if (pxFmt) this.candle.applyOptions({priceFormat: pxFmt});
+    this.applyData();
+    const n = this.bars.length;
+    this.ts.setVisibleLogicalRange({from: n - INIT_BARS, to: n - 1 + RIGHT_PAD});
+    this.showLegend(this.bars[n - 1]);
+  }
+
+  async changeInterval(iv) {
+    const lr = active && active !== this && active.ts.getVisibleLogicalRange();
+    this.iv = iv;
+    store.set('ivs', panes.map(p => p.iv));
+    setStatus(`加载 ${LABEL[iv]}...`);
+    try { await this.load(); setStatus(''); } catch (e) { setStatus('加载失败: ' + e.message, true); return; }
+    if (lr) this.centerOn(active.timeAt((lr.from + lr.to) / 2));
+    connectWs();
+  }
+
+  // 往前加载一页更早的K线,并保持画面不跳
+  async loadOlder() {
+    if (this.loading || this.exhausted || !this.bars.length) return 0;
+    this.loading = true;
+    try {
+      const older = await fetchKlines(this.iv, (this.bars[0].time - TZ) * 1000 - 1);
+      if (!older.length) { this.exhausted = true; return 0; }
+      const lr = this.ts.getVisibleLogicalRange();
+      this.bars = older.concat(this.bars);
+      this.applyData();
+      if (lr) this.ts.setVisibleLogicalRange({from: lr.from + older.length, to: lr.to + older.length});
+      return older.length;
+    } catch (e) {
+      setStatus('加载更早数据失败: ' + e.message, true);
+      return 0;
+    } finally { this.loading = false; }
+  }
+
+  // 逻辑序号 <-> 时间(数据范围外按周期外推)
+  timeAt(l) {
+    const b = this.bars, n = b.length;
+    if (l <= 0) return b[0].time + l * this.sec;
+    if (l >= n - 1) return b[n - 1].time + (l - n + 1) * this.sec;
+    const i = Math.floor(l);
+    return b[i].time + (l - i) * (b[i + 1].time - b[i].time);
+  }
+  indexOf(t) {
+    const b = this.bars, n = b.length;
+    if (t <= b[0].time) return (t - b[0].time) / this.sec;
+    if (t >= b[n - 1].time) return n - 1 + (t - b[n - 1].time) / this.sec;
+    let lo = 0, hi = n - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (b[m].time <= t) lo = m; else hi = m - 1; }
+    return lo + (t - b[lo].time) / (b[lo + 1].time - b[lo].time);
+  }
+
+  onRange(lr) {
+    this.renderBand();
+    if (active !== this || !lr || !this.bars.length) return;
+    if (lr.from < 20) this.loadOlder();
+    if (!userMoving()) return;
+    const center = this.timeAt((lr.from + lr.to) / 2);
+    for (const p of panes) if (p !== this) p.centerOn(center);
+  }
+
+  // 让本窗口的中心对到时间 t,保持本窗口自己的缩放; 最新那头不留大片空白
+  async centerOn(t) {
+    this.pendingT = t;
+    if (this.loading || !this.bars.length) return;
+    let pages = 0;
+    while (this.pendingT < this.bars[0].time && !this.exhausted && pages++ < MAX_PAGES) {
+      if (!(await this.loadOlder())) break;
+    }
+    const lr = this.ts.getVisibleLogicalRange();
+    const w = lr ? lr.to - lr.from : INIT_BARS;
+    const c = this.indexOf(this.pendingT), maxTo = this.bars.length - 1 + RIGHT_PAD;
+    let from = c - w / 2, to = c + w / 2;
+    if (to > maxTo) { from -= to - maxTo; to = maxTo; }
+    this.ts.setVisibleLogicalRange({from, to});
+  }
+
+  barAt(t) {
+    const i = Math.floor(this.indexOf(t));
+    return i >= 0 && i < this.bars.length ? this.bars[i] : null;
+  }
+
+  onCross(p) {
+    if (active !== this) return;
+    if (this.band || this.crossT != null) { this.band = null; this.crossT = null; this.renderBand(); }   // 自己带头时,去掉之前跟随时留下的标记
+    const b = p.time != null ? this.barAt(p.time) : null;
+    this.showLegend(b || this.bars[this.bars.length - 1]);
+    for (const o of panes) {
+      if (o === this || !o.bars.length) continue;
+      if (b) o.followCross(b.time, this.sec); else o.clearCross();
+    }
+  }
+
+  // 别的窗口指到了时间 t(那根K线长 srcSec 秒): 本窗口光标对到同一时间;
+  // 不在画面里就滚过去(还没加载就先往前加载); 比本窗口周期大的,把那一整段标亮
+  async followCross(t, srcSec) {
+    this.crossT = t;
+    this.band = srcSec > this.sec ? {from: t, to: t + srcSec} : null;
+    if (t < this.bars[0].time && !this.exhausted) {
+      await this.centerOn(t);
+      if (this.crossT !== t) return;
+    } else if (!mouseDown) {
+      const lr = this.ts.getVisibleLogicalRange(), i = this.indexOf(t);
+      if (lr && (i < lr.from + 1 || i > lr.to - 1)) this.centerOn(t);
+    }
+    this.drawCross();
+    requestAnimationFrame(() => this.drawCross());   // 刚滚动/刚加载完,等画面更新后再画一次,位置才准
+  }
+
+  drawCross() {
+    if (this.crossT == null) return;
+    const ob = this.barAt(this.crossT);
+    if (ob) { this.chart.setCrosshairPosition(ob.close, ob.time, this.candle); this.showLegend(ob); }
+    else this.chart.clearCrosshairPosition();
+    this.renderBand();
+  }
+
+  clearCross() {
+    this.crossT = null;
+    this.band = null;
+    this.chart.clearCrosshairPosition();
+    this.showLegend(this.bars[this.bars.length - 1]);
+    this.renderBand();
+  }
+
+  renderBand() {
+    const el = this.bandEl;
+    if (!this.band || !this.bars.length) { el.style.display = 'none'; return; }
+    const half = this.ts.options().barSpacing / 2;
+    const a = this.ts.logicalToCoordinate(this.indexOf(this.band.from));
+    const z = this.ts.logicalToCoordinate(this.indexOf(this.band.to - this.sec));
+    const w = this.ts.width();
+    if (a == null || z == null) { el.style.display = 'none'; return; }
+    const x1 = Math.max(0, a - half), x2 = Math.min(w, z + half);
+    if (x2 <= 0 || x1 >= w) { el.style.display = 'none'; return; }
+    el.style.left = x1 + 'px';
+    el.style.width = Math.max(2, x2 - x1) + 'px';
+    el.style.height = (this.chart.paneSize ? this.chart.paneSize().height : this.el.querySelector('.chart').clientHeight - this.ts.height()) + 'px';
+    el.style.display = 'block';
+  }
+
+  showLegend(b) {
+    if (!b) { this.legendEl.textContent = ''; return; }
+    const f = v => v.toFixed(pxFmt ? pxFmt.precision : 4);
+    const chg = (b.close / b.open - 1) * 100, amp = b.low > 0 ? (b.high - b.low) / b.low * 100 : 0;
+    const cls = chg >= 0 ? 'up' : 'down';
+    this.legendEl.innerHTML = `${fmtTime(b.time)}  开 ${f(b.open)} 高 ${f(b.high)} 低 ${f(b.low)} 收 <span class="${cls}">${f(b.close)}</span>`
+      + `  <span class="${cls}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>  振幅 ${amp.toFixed(2)}%  额 ${fmtVol(b.value)}`;
+  }
+
+  // WebSocket推过来的最新K线
+  push(b) {
+    const n = this.bars.length;
+    if (!n || b.time < this.bars[n - 1].time) return;
+    if (b.time === this.bars[n - 1].time) this.bars[n - 1] = b; else this.bars.push(b);
+    this.candle.update(b);
+    this.vol.update(this.volBar(b));
+  }
+}
+
+function connectWs() {
+  if (ws) { ws.onclose = null; ws.close(); }
+  if (!symbol) return;
+  const ivs = [...new Set(panes.map(p => p.iv))];
+  ws = new WebSocket(WS + ivs.map(iv => `${symbol.toLowerCase()}@kline_${iv}`).join('/'));
+  ws.onmessage = e => {
+    const k = JSON.parse(e.data).data.k;
+    const b = {time: Math.floor(k.t / 1000) + TZ, open: +k.o, high: +k.h, low: +k.l, close: +k.c, value: +k.q};
+    for (const p of panes) if (p.iv === k.i) p.push(b);
+  };
+  const sym = symbol;
+  ws.onclose = () => setTimeout(() => { if (sym === symbol) connectWs(); }, 3000);   // 断线自动重连
+}
+
+async function openSymbol(raw) {
+  const s = normSym(raw);
+  if (!s) return;
+  symbol = s;
+  $('sym').value = s;
+  store.set('symbol', s);
+  document.title = `${s} 多周期联动`;
+  $('lnk-tf').href = `https://www.tradeflow.club/analytics/smart-money-signal?symbol=${s}`;
+  $('lnk-cg').href = `https://www.coinglass.com/tv/zh/Binance_${s}`;
+  $('lnk-tv').href = `https://www.tradingview.com/chart/?symbol=BINANCE:${s}.P`;
+  setStatus(`加载 ${s}...`);
+  try {
+    const last = await fetchKlines('1m');
+    pxFmt = makePxFmt(last[last.length - 1].close);
+    await Promise.all(panes.map(p => p.load()));
+    setStatus('');
+  } catch (e) {
+    setStatus(`加载 ${s} 失败: ${e.message}`, true);
+    return;
+  }
+  connectWs();
+}
+
+function scaleMode() {
+  return logScale ? LightweightCharts.PriceScaleMode.Logarithmic : LightweightCharts.PriceScaleMode.Normal;
+}
+function setScale(log) {
+  logScale = log;
+  $('scale').textContent = log ? '对数坐标' : '线性坐标';
+  $('scale').title = '点击切换成' + (log ? '线性' : '对数') + '坐标';
+  for (const p of panes) p.chart.priceScale('right').applyOptions({mode: scaleMode()});
+  store.set('log', log);
+}
+
+function setLayout(mode) {
+  $('grid').className = mode;
+  $('layout').textContent = mode === 'cols' ? '竖排' : '横排';
+  store.set('layout', mode);
+}
+
+// ---- 启动 ----
+logScale = store.get('log', true);
+const ivs = store.get('ivs', ['1h', '15m', '5m']);
+panes = ivs.map((iv, i) => new Pane(SEC[iv] ? iv : ['1h', '15m', '5m'][i], i));
+setLayout(store.get('layout', 'cols'));
+setScale(logScale);
+$('scale').onclick = () => setScale(!logScale);
+$('go').onclick = () => openSymbol($('sym').value);
+$('sym').addEventListener('focus', e => e.target.select());
+$('sym').addEventListener('keydown', e => { if (e.key === 'Enter') openSymbol($('sym').value); });
+$('layout').onclick = () => setLayout($('grid').className === 'cols' ? 'rows' : 'cols');
+$('latest').onclick = () => panes.forEach(p => {
+  const n = p.bars.length, lr = p.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS;
+  p.ts.setVisibleLogicalRange({from: n - 1 + RIGHT_PAD - w, to: n - 1 + RIGHT_PAD});
+});
+const q = new URLSearchParams(location.search).get('symbol') || location.hash.slice(1);
+openSymbol(q || store.get('symbol', 'BTCUSDT'));
+</script>
+</body>
+</html>
