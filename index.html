@@ -10,6 +10,8 @@
   - 拖动/缩放任何一个窗口,另外两个自动滚到同一时间(各自保持自己的缩放)
   - 十字光标同步: 鼠标指到某根K线,另外两个窗口同一时刻也显示竖线
   - 往左拖到头会自动加载更早的K线; 最新K线走币安WebSocket实时更新
+  - 可以拆成2个或3个独立的浏览器窗口(顶部"窗口"下拉), 各窗口之间照样同步时间/光标/合约, "合并"收回一个窗口
+    (窗口之间用 BroadcastChannel 通信, 同一个浏览器里打开的才能互相同步)
   用法: 直接双击用浏览器打开; 也可以带参数 mtf_chart.html?symbol=ain
   注意: 跟其他脚本一样,需要能访问 fapi.binance.com(VPN开着)
 -->
@@ -31,8 +33,8 @@ a:hover{color:var(--accent)}
 #status.err{color:var(--down)}
 .links{margin-left:auto;display:flex;gap:12px}
 #grid{flex:1;display:grid;gap:4px;padding:4px;min-height:0}
-#grid.cols{grid-template-columns:repeat(3,minmax(0,1fr))}
-#grid.rows{grid-template-rows:repeat(3,minmax(0,1fr))}
+#grid.cols{grid-auto-flow:column;grid-auto-columns:minmax(0,1fr)}
+#grid.rows{grid-auto-flow:row;grid-auto-rows:minmax(0,1fr)}
 .pane{background:var(--panel);border:1px solid var(--line);min-height:0;min-width:0;display:flex;flex-direction:column}
 .pane.active{border-color:#4a4f57}
 .pane .bar{display:flex;gap:8px;align-items:center;padding:4px 6px;border-bottom:1px solid var(--line)}
@@ -41,7 +43,7 @@ a:hover{color:var(--accent)}
 .legend .up{color:var(--up)}.legend .down{color:var(--down)}
 .pane .chart{flex:1;min-height:0;position:relative}
 .band{position:absolute;top:0;display:none;pointer-events:none;z-index:3;background:rgba(240,185,11,.13);border-left:1px solid rgba(240,185,11,.6);border-right:1px solid rgba(240,185,11,.6)}
-@media (max-width:900px){#grid.cols{grid-template-columns:minmax(0,1fr);grid-template-rows:repeat(3,minmax(260px,1fr))}#grid{overflow:auto}}
+@media (max-width:900px){#grid.cols{grid-auto-flow:row;grid-auto-rows:minmax(260px,1fr);grid-auto-columns:auto}#grid{overflow:auto}}
 </style>
 </head>
 <body>
@@ -52,6 +54,10 @@ a:hover{color:var(--accent)}
   <button id="layout">竖排</button>
   <button id="latest">回到最新</button>
   <button id="scale">对数坐标</button>
+  <select id="split" title="拆成几个独立窗口(各窗口同步)">
+    <option value="1">1个窗口</option><option value="2">拆成2个窗口</option><option value="3">拆成3个窗口</option>
+  </select>
+  <button id="merge" style="display:none">合并窗口</button>
   <span id="status"></span>
   <span class="links">
     <a id="lnk-tf" target="_blank">TradeFlow</a>
@@ -73,6 +79,13 @@ const INIT_BARS = 200;      // 打开时每个窗口显示多少根
 const RIGHT_PAD = 5;
 
 const $ = id => document.getElementById(id);
+const URLQ = new URLSearchParams(location.search);
+const WIN = +(URLQ.get('win') || 0);                        // 0=主窗口, 1/2=拆出来的窗口
+const TF = (URLQ.get('tf') || '').split(',').filter(iv => SEC[iv]);   // 这个窗口显示哪几个周期(拆分时用)
+// 多个浏览器窗口之间同步: 时间/光标/合约
+const chan = 'BroadcastChannel' in window ? new BroadcastChannel('mtf_sync') : null;
+let fromRemote = false;
+function post(msg) { if (chan && !fromRemote) chan.postMessage(msg); }
 let symbol = '', panes = [], active = null, ws = null, pxFmt = null, mouseDown = false;
 let logScale = true;   // 价格轴默认用对数坐标
 addEventListener('pointerdown', () => { mouseDown = true; }, true);
@@ -185,7 +198,7 @@ class Pane {
   async changeInterval(iv) {
     const lr = active && active !== this && active.ts.getVisibleLogicalRange();
     this.iv = iv;
-    store.set('ivs', panes.map(p => p.iv));
+    if (!TF.length) store.set('ivs', panes.map(p => p.iv));   // 拆出来的窗口不改主窗口记住的周期
     setStatus(`加载 ${LABEL[iv]}...`);
     try { await this.load(); setStatus(''); } catch (e) { setStatus('加载失败: ' + e.message, true); return; }
     if (lr) this.centerOn(active.timeAt((lr.from + lr.to) / 2));
@@ -234,6 +247,7 @@ class Pane {
     if (!userMoving()) return;
     const center = this.timeAt((lr.from + lr.to) / 2);
     for (const p of panes) if (p !== this) p.centerOn(center);
+    post({t: 'range', c: center});
   }
 
   // 让本窗口的中心对到时间 t,保持本窗口自己的缩放; 最新那头不留大片空白
@@ -266,6 +280,7 @@ class Pane {
       if (o === this || !o.bars.length) continue;
       if (b) o.followCross(b.time, this.sec); else o.clearCross();
     }
+    post(b ? {t: 'cross', time: b.time, sec: this.sec} : {t: 'clear'});
   }
 
   // 别的窗口指到了时间 t(那根K线长 srcSec 秒): 本窗口光标对到同一时间;
@@ -352,10 +367,11 @@ function connectWs() {
 async function openSymbol(raw) {
   const s = normSym(raw);
   if (!s) return;
+  if (s !== symbol) post({t: 'sym', s});
   symbol = s;
   $('sym').value = s;
   store.set('symbol', s);
-  document.title = `${s} 多周期联动`;
+  document.title = `${s} 多周期联动` + (TF.length ? ` · ${TF.map(iv => LABEL[iv]).join('/')}` : '');
   $('lnk-tf').href = `https://www.tradeflow.club/analytics/smart-money-signal?symbol=${s}`;
   $('lnk-cg').href = `https://www.coinglass.com/tv/zh/Binance_${s}`;
   $('lnk-tv').href = `https://www.tradingview.com/chart/?symbol=BINANCE:${s}.P`;
@@ -383,6 +399,49 @@ function setScale(log) {
   store.set('log', log);
 }
 
+// ---- 拆分成多个浏览器窗口 ----
+function pageUrl(tfs, win) {
+  const u = new URL(location.href);
+  u.search = '';
+  u.searchParams.set('symbol', symbol);
+  if (tfs) { u.searchParams.set('tf', tfs.join(',')); u.searchParams.set('win', win); }
+  return u.toString();
+}
+function split(n) {
+  const all = panes.map(p => p.iv);
+  if (!TF.length) store.set('ivs', all);
+  const groups = n === 2 ? [all.slice(0, 2), all.slice(2)] : all.map(iv => [iv]);
+  const w = Math.floor(screen.availWidth / n), h = screen.availHeight;
+  // 先开出另外几个窗口(必须在点击里直接开, 不然会被浏览器拦), 再把自己变成第一组
+  for (let i = 1; i < n; i++) {
+    const win = window.open(pageUrl(groups[i], i), 'mtf_win_' + i,
+      `left=${screen.availLeft + i * w},top=${screen.availTop},width=${w},height=${h}`);
+    if (!win) { setStatus('浏览器拦截了弹出窗口, 请在地址栏右侧允许本网站弹出窗口后再试', true); $('split').value = '1'; return; }
+  }
+  try { window.moveTo(screen.availLeft, screen.availTop); window.resizeTo(w, h); } catch {}
+  location.replace(pageUrl(groups[0], 0));
+}
+function merge() {
+  fromRemote = false;
+  post({t: 'close'});
+  if (WIN > 0) { window.close(); return; }
+  location.replace(pageUrl(null));
+}
+
+// 收到别的窗口发来的同步消息
+if (chan) chan.onmessage = e => {
+  const m = e.data;
+  if (active) { active.el.classList.remove('active'); active = null; }   // 用户在别的窗口操作, 本窗口只跟随
+  fromRemote = true;
+  try {
+    if (m.t === 'range') panes.forEach(p => p.bars.length && p.centerOn(m.c));
+    else if (m.t === 'cross') panes.forEach(p => p.bars.length && p.followCross(m.time, m.sec));
+    else if (m.t === 'clear') panes.forEach(p => p.bars.length && p.clearCross());
+    else if (m.t === 'sym' && normSym(m.s) !== symbol) openSymbol(m.s);
+    else if (m.t === 'close') { if (WIN > 0) window.close(); else if (TF.length) location.replace(pageUrl(null)); }
+  } finally { fromRemote = false; }
+};
+
 function setLayout(mode) {
   $('grid').className = mode;
   $('layout').textContent = mode === 'cols' ? '竖排' : '横排';
@@ -391,8 +450,15 @@ function setLayout(mode) {
 
 // ---- 启动 ----
 logScale = store.get('log', true);
-const ivs = store.get('ivs', ['1h', '15m', '5m']);
+const ivs = TF.length ? TF : store.get('ivs', ['1h', '15m', '5m']);
 panes = ivs.map((iv, i) => new Pane(SEC[iv] ? iv : ['1h', '15m', '5m'][i], i));
+if (TF.length) {                                     // 拆出来的窗口: 显示"合并"按钮, 标题标上第几个窗口
+  $('split').style.display = 'none';
+  $('merge').style.display = '';
+  document.querySelector('header b').textContent = `多周期联动 · 窗口${WIN + 1}`;
+}
+$('split').onchange = e => { const n = +e.target.value; if (n > 1) split(n); };
+$('merge').onclick = merge;
 setLayout(store.get('layout', 'cols'));
 setScale(logScale);
 $('scale').onclick = () => setScale(!logScale);
@@ -404,7 +470,7 @@ $('latest').onclick = () => panes.forEach(p => {
   const n = p.bars.length, lr = p.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS;
   p.ts.setVisibleLogicalRange({from: n - 1 + RIGHT_PAD - w, to: n - 1 + RIGHT_PAD});
 });
-const q = new URLSearchParams(location.search).get('symbol') || location.hash.slice(1);
+const q = URLQ.get('symbol') || location.hash.slice(1);
 openSymbol(q || store.get('symbol', 'BTCUSDT'));
 </script>
 </body>
