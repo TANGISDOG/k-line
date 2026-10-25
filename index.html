@@ -12,6 +12,8 @@
   - 往左拖到头会自动加载更早的K线; 最新K线走币安WebSocket实时更新
   - 可以拆成2个或3个独立的浏览器窗口(顶部"窗口"下拉), 各窗口之间照样同步时间/光标/合约, "合并"收回一个窗口
     (窗口之间用 BroadcastChannel 通信, 同一个浏览器里打开的才能互相同步)
+  - 测量: 按住 Shift 拖动(或点"📏测量"后直接拖动)选一段K线, 显示这一段的涨跌幅/振幅/起止时间/时长;
+    点一下或按 Esc 清除
   用法: 直接双击用浏览器打开; 也可以带参数 mtf_chart.html?symbol=ain
   注意: 跟其他脚本一样,需要能访问 fapi.binance.com(VPN开着)
 -->
@@ -42,6 +44,15 @@ a:hover{color:var(--accent)}
 .legend{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .legend .up{color:var(--up)}.legend .down{color:var(--down)}
 .pane .chart{flex:1;min-height:0;position:relative}
+.measure{position:absolute;top:0;display:none;pointer-events:none;z-index:4;border-left:1px dashed;border-right:1px dashed}
+.measure.up{background:rgba(14,203,129,.13);border-color:rgba(14,203,129,.8)}
+.measure.down{background:rgba(246,70,93,.13);border-color:rgba(246,70,93,.8)}
+.mlabel{position:absolute;top:6px;display:none;pointer-events:none;z-index:5;background:rgba(24,28,33,.94);border:1px solid var(--line);
+  border-radius:4px;padding:5px 8px;font-size:12px;line-height:1.55;white-space:nowrap;font-variant-numeric:tabular-nums}
+.mlabel .big{font-size:14px;font-weight:600}
+.mlabel .up{color:var(--up)}.mlabel .down{color:var(--down)}.mlabel .dim{color:var(--muted)}
+body.measuring .chart{cursor:crosshair}
+#measure.on{border-color:var(--accent);color:var(--accent)}
 .band{position:absolute;top:0;display:none;pointer-events:none;z-index:3;background:rgba(240,185,11,.13);border-left:1px solid rgba(240,185,11,.6);border-right:1px solid rgba(240,185,11,.6)}
 @media (max-width:900px){#grid.cols{grid-auto-flow:row;grid-auto-rows:minmax(260px,1fr);grid-auto-columns:auto}#grid{overflow:auto}}
 </style>
@@ -54,6 +65,7 @@ a:hover{color:var(--accent)}
   <button id="layout">竖排</button>
   <button id="latest">回到最新</button>
   <button id="scale">对数坐标</button>
+  <button id="measure" title="打开后直接拖动就是测量; 不打开时按住Shift拖动也能测量; Esc清除">📏 测量</button>
   <select id="split" title="拆成几个独立窗口(各窗口同步)">
     <option value="1">1个窗口</option><option value="2">拆成2个窗口</option><option value="3">拆成3个窗口</option>
   </select>
@@ -88,6 +100,7 @@ let fromRemote = false;
 function post(msg) { if (chan && !fromRemote) chan.postMessage(msg); }
 let symbol = '', panes = [], active = null, ws = null, pxFmt = null, mouseDown = false;
 let logScale = true;   // 价格轴默认用对数坐标
+let measureMode = false;   // 📏测量 打开后, 直接拖动就是测量(不打开时按住 Shift 拖动)
 addEventListener('pointerdown', () => { mouseDown = true; }, true);
 addEventListener('pointerup', () => { mouseDown = false; }, true);
 addEventListener('pointercancel', () => { mouseDown = false; }, true);
@@ -157,6 +170,33 @@ class Pane {
     this.bandEl.className = 'band';
     box.appendChild(this.bandEl);
     this.band = null;
+    this.mEl = document.createElement('div');
+    this.mEl.className = 'measure';
+    this.mLabel = document.createElement('div');
+    this.mLabel.className = 'mlabel';
+    box.append(this.mEl, this.mLabel);
+    this.measure = null;                     // {a: 开始时间, b: 结束时间}
+    this.box = box;
+    // 测量: 在图表接到事件之前截住(捕获阶段), 不让它变成平移
+    const wantMeasure = e => (measureMode || e.shiftKey) && e.button === 0 && this.bars.length;
+    box.addEventListener('mousedown', e => { if (wantMeasure(e)) { e.stopPropagation(); e.preventDefault(); } }, true);
+    box.addEventListener('pointerdown', e => {
+      if (!wantMeasure(e)) return;
+      e.stopPropagation(); e.preventDefault();
+      const left = box.getBoundingClientRect().left;
+      const t0 = this.timeAtX(e.clientX - left);
+      if (t0 == null) return;
+      this.measure = {a: t0, b: t0};
+      this.renderMeasure();
+      const move = ev => { const t = this.timeAtX(ev.clientX - left); if (t != null) { this.measure.b = t; this.renderMeasure(); } };
+      const up = () => {
+        removeEventListener('pointermove', move, true);
+        removeEventListener('pointerup', up, true);
+        if (this.measure && this.measure.a === this.measure.b) { this.measure = null; this.renderMeasure(); }   // 只点了一下 = 清除
+      };
+      addEventListener('pointermove', move, true);
+      addEventListener('pointerup', up, true);
+    }, true);
     this.chart = LightweightCharts.createChart(box, {
       autoSize: true,
       layout: {background: {color: '#161a1e'}, textColor: '#848e9c'},
@@ -187,6 +227,8 @@ class Pane {
 
   async load() {
     this.exhausted = false;
+    this.measure = null;
+    this.renderMeasure();
     this.bars = await fetchKlines(this.iv);
     if (pxFmt) this.candle.applyOptions({priceFormat: pxFmt});
     this.applyData();
@@ -242,6 +284,7 @@ class Pane {
 
   onRange(lr) {
     this.renderBand();
+    this.renderMeasure();
     if (active !== this || !lr || !this.bars.length) return;
     if (lr.from < 20) this.loadOlder();
     if (!userMoving()) return;
@@ -329,6 +372,50 @@ class Pane {
     el.style.width = Math.max(2, x2 - x1) + 'px';
     el.style.height = (this.chart.paneSize ? this.chart.paneSize().height : this.el.querySelector('.chart').clientHeight - this.ts.height()) + 'px';
     el.style.display = 'block';
+  }
+
+  // 屏幕横坐标 -> 最近那根K线的开盘时间
+  timeAtX(x) {
+    const l = this.ts.coordinateToLogical(x);
+    if (l == null || !this.bars.length) return null;
+    return this.bars[Math.max(0, Math.min(this.bars.length - 1, Math.round(l)))].time;
+  }
+
+  renderMeasure() {
+    const el = this.mEl, lab = this.mLabel;
+    if (!this.measure || !this.bars.length) { el.style.display = lab.style.display = 'none'; return; }
+    let i0 = Math.round(this.indexOf(this.measure.a)), i1 = Math.round(this.indexOf(this.measure.b));
+    if (i0 > i1) [i0, i1] = [i1, i0];
+    i0 = Math.max(0, i0); i1 = Math.min(this.bars.length - 1, i1);
+    const seg = this.bars.slice(i0, i1 + 1);
+    if (!seg.length) { el.style.display = lab.style.display = 'none'; return; }
+    const open = seg[0].open, close = seg[seg.length - 1].close;
+    const hi = Math.max(...seg.map(b => b.high)), lo = Math.min(...seg.map(b => b.low));
+    const chg = (close / open - 1) * 100, amp = lo > 0 ? (hi - lo) / lo * 100 : 0;
+    const vol = seg.reduce((a, b) => a + b.value, 0);
+    const secs = seg[seg.length - 1].time + this.sec - seg[0].time;
+    const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
+    const dur = (d ? d + '天' : '') + (h ? h + '小时' : '') + (m && !d ? m + '分' : '') || '0分';
+    const up = chg >= 0, f = v => v.toFixed(pxFmt ? pxFmt.precision : 4);
+    // 位置
+    const half = this.ts.options().barSpacing / 2, w = this.ts.width();
+    const a = this.ts.logicalToCoordinate(i0), z = this.ts.logicalToCoordinate(i1);
+    if (a == null || z == null) { el.style.display = lab.style.display = 'none'; return; }
+    const x1 = Math.max(0, a - half), x2 = Math.min(w, z + half);
+    if (x2 <= 0 || x1 >= w) { el.style.display = lab.style.display = 'none'; return; }
+    el.className = 'measure ' + (up ? 'up' : 'down');
+    el.style.left = x1 + 'px';
+    el.style.width = Math.max(2, x2 - x1) + 'px';
+    el.style.height = (this.chart.paneSize ? this.chart.paneSize().height : this.box.clientHeight - this.ts.height()) + 'px';
+    el.style.display = 'block';
+    lab.innerHTML = `<span class="big ${up ? 'up' : 'down'}">${up ? '📈 +' : '📉 '}${chg.toFixed(2)}%</span>`
+      + `&nbsp;&nbsp;振幅 <b>${amp.toFixed(2)}%</b><br>`
+      + `${fmtTime(seg[0].time)} → ${fmtTime(seg[seg.length - 1].time + this.sec)}<br>`
+      + `<span class="dim">${dur} · ${seg.length}根K线</span><br>`
+      + `<span class="dim">高 ${f(hi)}  低 ${f(lo)}  额 ${fmtVol(vol)}</span>`;
+    lab.style.display = 'block';
+    const lw = lab.offsetWidth;
+    lab.style.left = Math.max(4, Math.min(w - lw - 4, x2 + 6 + lw > w ? x1 - lw - 6 : x2 + 6)) + 'px';
   }
 
   showLegend(b) {
@@ -442,6 +529,17 @@ if (chan) chan.onmessage = e => {
   } finally { fromRemote = false; }
 };
 
+function setMeasureMode(on) {
+  measureMode = on;
+  $('measure').classList.toggle('on', on);
+  document.body.classList.toggle('measuring', on);
+}
+addEventListener('keydown', e => {
+  if (e.key === 'Escape') panes.forEach(p => { p.measure = null; p.renderMeasure(); });
+  if (e.key === 'Shift') document.body.classList.add('measuring');
+});
+addEventListener('keyup', e => { if (e.key === 'Shift' && !measureMode) document.body.classList.remove('measuring'); });
+
 function setLayout(mode) {
   $('grid').className = mode;
   $('layout').textContent = mode === 'cols' ? '竖排' : '横排';
@@ -459,6 +557,7 @@ if (TF.length) {                                     // 拆出来的窗口: 显�
 }
 $('split').onchange = e => { const n = +e.target.value; if (n > 1) split(n); };
 $('merge').onclick = merge;
+$('measure').onclick = () => setMeasureMode(!measureMode);
 setLayout(store.get('layout', 'cols'));
 setScale(logScale);
 $('scale').onclick = () => setScale(!logScale);
