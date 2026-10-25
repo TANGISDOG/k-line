@@ -14,6 +14,8 @@
     (窗口之间用 BroadcastChannel 通信, 同一个浏览器里打开的才能互相同步)
   - 测量: 按住 Shift 拖动(或点"📏测量"后直接拖动)选一段K线, 显示这一段的涨跌幅/振幅/起止时间/时长;
     点一下或按 Esc 清除
+  - 固定时间(复盘): 以最小周期窗口画面最右边那根K线的收盘时刻为"当前时间", 大周期只显示到这个时间,
+    没走完的那根用最小周期K线现场拼出来; 往右拖最小周期, 大周期K线一点点长出来; 大周期最右边始终对齐当前时间
   用法: 直接双击用浏览器打开; 也可以带参数 mtf_chart.html?symbol=ain
   注意: 跟其他脚本一样,需要能访问 fapi.binance.com(VPN开着)
 -->
@@ -52,7 +54,8 @@ a:hover{color:var(--accent)}
 .mlabel .big{font-size:14px;font-weight:600}
 .mlabel .up{color:var(--up)}.mlabel .down{color:var(--down)}.mlabel .dim{color:var(--muted)}
 body.measuring .chart{cursor:crosshair}
-#measure.on{border-color:var(--accent);color:var(--accent)}
+#measure.on,#replay.on{border-color:var(--accent);color:var(--accent)}
+#replay.on{background:rgba(240,185,11,.12)}
 .band{position:absolute;top:0;display:none;pointer-events:none;z-index:3;background:rgba(240,185,11,.13);border-left:1px solid rgba(240,185,11,.6);border-right:1px solid rgba(240,185,11,.6)}
 @media (max-width:900px){#grid.cols{grid-auto-flow:row;grid-auto-rows:minmax(260px,1fr);grid-auto-columns:auto}#grid{overflow:auto}}
 </style>
@@ -65,6 +68,7 @@ body.measuring .chart{cursor:crosshair}
   <button id="layout">竖排</button>
   <button id="latest">回到最新</button>
   <button id="scale">对数坐标</button>
+  <button id="replay" title="复盘: 大周期只显示到最小周期画面最右边的时间, 往右拖最小周期, 大周期K线一点点长出来">⏸ 固定时间</button>
   <button id="measure" title="打开后直接拖动就是测量; 不打开时按住Shift拖动也能测量; Esc清除">📏 测量</button>
   <select id="split" title="拆成几个独立窗口(各窗口同步)">
     <option value="1">1个窗口</option><option value="2">拆成2个窗口</option><option value="3">拆成3个窗口</option>
@@ -100,12 +104,16 @@ let fromRemote = false;
 function post(msg) { if (chan && !fromRemote) chan.postMessage(msg); }
 let symbol = '', panes = [], active = null, ws = null, pxFmt = null, mouseDown = false;
 let logScale = true;   // 价格轴默认用对数坐标
+let replay = false, replayT = null, replayIv = null;   // 固定时间(复盘): 当前时间(K线时间轴上的秒) / 基准周期
+const fineCache = new Map();                              // 拼"没走完的大周期K线"用的小周期K线缓存
 let measureMode = false;   // 📏测量 打开后, 直接拖动就是测量(不打开时按住 Shift 拖动)
 addEventListener('pointerdown', () => { mouseDown = true; }, true);
 addEventListener('pointerup', () => { mouseDown = false; }, true);
 addEventListener('pointercancel', () => { mouseDown = false; }, true);
-let lastWheel = 0;
-addEventListener('wheel', () => { lastWheel = Date.now(); }, {capture: true, passive: true});
+let lastWheel = 0, lastWheelPan = false;
+// 滚轮: 上下滚/双指捏合 = 缩放; 触控板左右滑 = 平移(固定时间模式下要区分: 平移才让时间前进, 缩放不能露出未来)
+addEventListener('wheel', e => { lastWheel = Date.now(); lastWheelPan = Math.abs(e.deltaX) > Math.abs(e.deltaY) && !e.ctrlKey; },
+                 {capture: true, passive: true});
 // 只有用户真的在拖动/滚轮缩放时才带着别的窗口滚; 实时推价、加载更早数据引起的画面变化不联动,
 // 否则会把别的窗口从"对准光标"的位置拉走
 const userMoving = () => mouseDown || Date.now() - lastWheel < 400;
@@ -150,7 +158,7 @@ function fmtTime(t) {
 
 class Pane {
   constructor(iv, idx) {
-    this.iv = iv; this.idx = idx; this.bars = []; this.loading = false; this.exhausted = false; this.pendingT = null;
+    this.iv = iv; this.idx = idx; this.bars = []; this.all = []; this.pinUntil = 0; this.loading = false; this.exhausted = false; this.pendingT = null;
     this.el = document.createElement('div');
     this.el.className = 'pane';
     this.el.innerHTML = `<div class="bar"><select>${Object.keys(SEC).map(k =>
@@ -229,7 +237,7 @@ class Pane {
     this.exhausted = false;
     this.measure = null;
     this.renderMeasure();
-    this.bars = await fetchKlines(this.iv);
+    this.all = this.bars = await fetchKlines(this.iv);
     if (pxFmt) this.candle.applyOptions({priceFormat: pxFmt});
     this.applyData();
     const n = this.bars.length;
@@ -243,19 +251,21 @@ class Pane {
     if (!TF.length) store.set('ivs', panes.map(p => p.iv));   // 拆出来的窗口不改主窗口记住的周期
     setStatus(`加载 ${LABEL[iv]}...`);
     try { await this.load(); setStatus(''); } catch (e) { setStatus('加载失败: ' + e.message, true); return; }
+    if (replay) { setReplay(true); connectWs(); return; }
     if (lr) this.centerOn(active.timeAt((lr.from + lr.to) / 2));
     connectWs();
   }
 
   // 往前加载一页更早的K线,并保持画面不跳
   async loadOlder() {
-    if (this.loading || this.exhausted || !this.bars.length) return 0;
+    if (this.loading || this.exhausted || !this.all.length) return 0;
     this.loading = true;
     try {
-      const older = await fetchKlines(this.iv, (this.bars[0].time - TZ) * 1000 - 1);
+      const older = await fetchKlines(this.iv, (this.all[0].time - TZ) * 1000 - 1);
       if (!older.length) { this.exhausted = true; return 0; }
       const lr = this.ts.getVisibleLogicalRange();
-      this.bars = older.concat(this.bars);
+      this.all = older.concat(this.all);
+      this.bars = this.replayed() ? this.cutBars(replayT) : this.all;
       this.applyData();
       if (lr) this.ts.setVisibleLogicalRange({from: lr.from + older.length, to: lr.to + older.length});
       return older.length;
@@ -285,9 +295,21 @@ class Pane {
   onRange(lr) {
     this.renderBand();
     this.renderMeasure();
+    if (Date.now() < this.pinUntil) return;          // 固定时间模式下程序自己钉右边引起的变化, 不处理
     if (active !== this || !lr || !this.bars.length) return;
     if (lr.from < 20) this.loadOlder();
     if (!userMoving()) return;
+    if (replay) {
+      if (this.replayed()) this.pin();               // 大周期: 只能缩放, 右边始终钉在当前时间
+      else if (!mouseDown && !lastWheelPan) this.alignRight(replayT);   // 基准在缩放: 右边钉住, 只缩放左边, 不露出未来
+      else {                                         // 基准在拖动/平移: 它的右边就是"当前时间"
+        replayIv = this.iv;
+        replayT = this.rightEdgeT();
+        refreshReplay();
+        post({t: 'replay', on: true, T: replayT, iv: replayIv});
+      }
+      return;
+    }
     const center = this.timeAt((lr.from + lr.to) / 2);
     for (const p of panes) if (p !== this) p.centerOn(center);
     post({t: 'range', c: center});
@@ -318,7 +340,7 @@ class Pane {
     if (active !== this) return;
     if (this.band || this.crossT != null) { this.band = null; this.crossT = null; this.renderBand(); }   // 自己带头时,去掉之前跟随时留下的标记
     const b = p.time != null ? this.barAt(p.time) : null;
-    this.showLegend(b || this.bars[this.bars.length - 1]);
+    this.showLegend(b || this.nowBar());
     for (const o of panes) {
       if (o === this || !o.bars.length) continue;
       if (b) o.followCross(b.time, this.sec); else o.clearCross();
@@ -331,10 +353,10 @@ class Pane {
   async followCross(t, srcSec) {
     this.crossT = t;
     this.band = srcSec > this.sec ? {from: t, to: t + srcSec} : null;
-    if (t < this.bars[0].time && !this.exhausted) {
+    if (t < this.bars[0].time && !this.exhausted && !replay) {
       await this.centerOn(t);
       if (this.crossT !== t) return;
-    } else if (!mouseDown) {
+    } else if (!mouseDown && !replay) {
       const lr = this.ts.getVisibleLogicalRange(), i = this.indexOf(t);
       if (lr && (i < lr.from + 1 || i > lr.to - 1)) this.centerOn(t);
     }
@@ -354,7 +376,7 @@ class Pane {
     this.crossT = null;
     this.band = null;
     this.chart.clearCrosshairPosition();
-    this.showLegend(this.bars[this.bars.length - 1]);
+    this.showLegend(this.nowBar());
     this.renderBand();
   }
 
@@ -429,11 +451,89 @@ class Pane {
 
   // WebSocket推过来的最新K线
   push(b) {
-    const n = this.bars.length;
-    if (!n || b.time < this.bars[n - 1].time) return;
-    if (b.time === this.bars[n - 1].time) this.bars[n - 1] = b; else this.bars.push(b);
+    const a = this.all, n = a.length;
+    if (!n || b.time < a[n - 1].time) return;
+    if (b.time === a[n - 1].time) a[n - 1] = b; else a.push(b);
+    if (this.bars !== a) return;                    // 固定时间模式下大周期不显示最新的
     this.candle.update(b);
     this.vol.update(this.volBar(b));
+  }
+
+  // 信息栏默认显示哪根: 平时是最新那根; 固定时间模式下基准周期显示"当前时间"那根(不剧透后面)
+  nowBar() {
+    if (replay && replayT != null && !this.replayed()) return this.barAt(replayT - this.sec) || this.bars[this.bars.length - 1];
+    return this.bars[this.bars.length - 1];
+  }
+
+  // ---- 固定时间(复盘) ----
+  replayed() { return replay && replayIv && this.sec > SEC[replayIv]; }   // 比基准周期大的才截断
+
+  rightEdgeT() {                                    // 画面最右边那根K线的收盘时刻
+    const lr = this.ts.getVisibleLogicalRange(), n = this.all.length;
+    const i = Math.max(0, Math.min(n - 1, Math.floor(lr ? lr.to : n - 1)));
+    return this.all[i].time + this.sec;
+  }
+
+  // 截到时间 T: 走完的照常显示, 正在走的那根用小周期K线拼出 T 那一刻的样子
+  cutBars(T) {
+    const out = [];
+    for (const b of this.all) {
+      if (b.time + this.sec <= T) { out.push(b); continue; }
+      if (b.time < T) {
+        const seg = this.fineBars(b.time).filter(f => f.time >= b.time && f.time < T);
+        if (seg.length) out.push({time: b.time, open: seg[0].open, close: seg[seg.length - 1].close,
+          high: Math.max(...seg.map(f => f.high)), low: Math.min(...seg.map(f => f.low)),
+          value: seg.reduce((x, f) => x + f.value, 0)});
+      }
+      break;
+    }
+    return out;
+  }
+
+  // 拼 [start, start+本周期) 这根K线要用的小周期K线: 本窗口有基准周期的数据就直接用, 没有就去币安取一次(缓存)
+  fineBars(start) {
+    const src = panes.find(p => p.iv === replayIv);
+    if (src && src.all.length && src.all[0].time <= start) return src.all;
+    const key = `${symbol}|${replayIv}|${start}|${this.sec}`;
+    if (fineCache.has(key)) return fineCache.get(key);
+    fineCache.set(key, []);
+    const p = new URLSearchParams({symbol, interval: replayIv, limit: 1500,
+      startTime: (start - TZ) * 1000, endTime: (start + this.sec - TZ) * 1000 - 1});
+    fetch(`${API}/fapi/v1/klines?${p}`).then(r => r.json()).then(d => {
+      fineCache.set(key, d.map(toBar));
+      refreshReplay();
+    }).catch(() => fineCache.delete(key));
+    return [];
+  }
+
+  pin() {                                           // 保持缩放, 把最右边钉在最后一根(当前时间)
+    const lr = this.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS, n = this.bars.length;
+    this.pinUntil = Date.now() + 120;
+    this.ts.setVisibleLogicalRange({from: n + 1 - w, to: n + 1});
+  }
+
+  alignRight(T) {                                   // 跟基准一样细或更细的周期: 不截断, 只把右边对到 T
+    const lr = this.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS;
+    const to = this.indexOf(T) - 0.5;              // 正好到 T 之前那根的右边, 一点"未来"都不露
+    this.pinUntil = Date.now() + 120;
+    this.ts.setVisibleLogicalRange({from: to - w, to});
+  }
+
+  applyReplay() {
+    if (this.replayed()) {
+      this.bars = this.cutBars(replayT);
+      if (!this.bars.length) return;
+      this.applyData();
+      this.pin();
+      this.showLegend(this.bars[this.bars.length - 1]);
+    } else {
+      if (this.bars !== this.all) { this.bars = this.all; this.applyData(); }
+      if (this.iv !== replayIv || active !== this) this.alignRight(replayT);
+      // 基准周期右边还有"未来"的K线(往右拖才能前进), 把最新价那条线/标签藏起来, 信息栏显示当前时间那根
+      this.candle.applyOptions({lastValueVisible: false, priceLineVisible: false});
+      const b = this.barAt(replayT - this.sec);
+      if (b && this.crossT == null) this.showLegend(b);
+    }
   }
 }
 
@@ -467,7 +567,9 @@ async function openSymbol(raw) {
     const last = await fetchKlines('1m');
     pxFmt = makePxFmt(last[last.length - 1].close);
     await Promise.all(panes.map(p => p.load()));
+    fineCache.clear();
     setStatus('');
+    if (replay) setReplay(true, fromRemote);
   } catch (e) {
     setStatus(`加载 ${s} 失败: ${e.message}`, true);
     return;
@@ -484,6 +586,36 @@ function setScale(log) {
   $('scale').title = '点击切换成' + (log ? '线性' : '对数') + '坐标';
   for (const p of panes) p.chart.priceScale('right').applyOptions({mode: scaleMode()});
   store.set('log', log);
+}
+
+// ---- 固定时间(复盘) ----
+function refreshReplay() {
+  if (!replay || replayT == null) return;
+  panes.forEach(p => p.all.length && p.applyReplay());
+  setStatus('⏸ 固定时间: ' + fmtTime(replayT) + '  (往右拖最小周期, 时间往后走)');
+}
+function setReplay(on, remote) {
+  replay = on;
+  $('replay').classList.toggle('on', on);
+  $('replay').textContent = on ? '▶ 取消固定' : '⏸ 固定时间';
+  if (on) {
+    if (!remote) {                                  // 以本窗口最小周期画面最右边为当前时间
+      const base = panes.filter(p => p.all.length).sort((a, b) => a.sec - b.sec)[0];
+      if (!base) return;
+      replayIv = base.iv;
+      replayT = base.rightEdgeT();
+      post({t: 'replay', on: true, T: replayT, iv: replayIv});
+    }
+    refreshReplay();
+  } else {
+    panes.forEach(p => {
+      if (p.bars !== p.all) { p.bars = p.all; p.applyData(); }
+      p.candle.applyOptions({lastValueVisible: true, priceLineVisible: true});
+      p.showLegend(p.bars[p.bars.length - 1]);
+    });
+    if (!remote) post({t: 'replay', on: false});
+    setStatus('');
+  }
 }
 
 // ---- 拆分成多个浏览器窗口 ----
@@ -525,6 +657,10 @@ if (chan) chan.onmessage = e => {
     else if (m.t === 'cross') panes.forEach(p => p.bars.length && p.followCross(m.time, m.sec));
     else if (m.t === 'clear') panes.forEach(p => p.bars.length && p.clearCross());
     else if (m.t === 'sym' && normSym(m.s) !== symbol) openSymbol(m.s);
+    else if (m.t === 'replay') {
+      if (m.on) { replayT = m.T; replayIv = m.iv; if (!replay) setReplay(true, true); else refreshReplay(); }
+      else if (replay) setReplay(false, true);
+    }
     else if (m.t === 'close') { if (WIN > 0) window.close(); else if (TF.length) location.replace(pageUrl(null)); }
   } finally { fromRemote = false; }
 };
@@ -557,6 +693,7 @@ if (TF.length) {                                     // 拆出来的窗口: 显�
 }
 $('split').onchange = e => { const n = +e.target.value; if (n > 1) split(n); };
 $('merge').onclick = merge;
+$('replay').onclick = () => setReplay(!replay);
 $('measure').onclick = () => setMeasureMode(!measureMode);
 setLayout(store.get('layout', 'cols'));
 setScale(logScale);
@@ -565,10 +702,15 @@ $('go').onclick = () => openSymbol($('sym').value);
 $('sym').addEventListener('focus', e => e.target.select());
 $('sym').addEventListener('keydown', e => { if (e.key === 'Enter') openSymbol($('sym').value); });
 $('layout').onclick = () => setLayout($('grid').className === 'cols' ? 'rows' : 'cols');
-$('latest').onclick = () => panes.forEach(p => {
-  const n = p.bars.length, lr = p.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS;
-  p.ts.setVisibleLogicalRange({from: n - 1 + RIGHT_PAD - w, to: n - 1 + RIGHT_PAD});
-});
+$('latest').onclick = () => {
+  panes.forEach(p => {
+    if (p.bars !== p.all) { p.bars = p.all; p.applyData(); }
+    const n = p.bars.length, lr = p.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS;
+    p.pinUntil = Date.now() + 120;
+    p.ts.setVisibleLogicalRange({from: n - 0.5 - w, to: n - 0.5});
+  });
+  if (replay) setTimeout(() => setReplay(true), 150);   // 固定时间模式: 当前时间回到最新
+};
 const q = URLQ.get('symbol') || location.hash.slice(1);
 openSymbol(q || store.get('symbol', 'BTCUSDT'));
 </script>
