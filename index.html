@@ -519,10 +519,31 @@ class Pane {
     this.ts.setVisibleLogicalRange({from: to - w, to});
   }
 
+  // 固定时间退到了本窗口已加载数据之前: 先往前补加载历史K线(补够前面一屏), 补完再重新截断显示
+  ensureHistory() {
+    const lr = this.ts.getVisibleLogicalRange(), w = Math.max(50, lr ? lr.to - lr.from : INIT_BARS);
+    const need = replayT - w * this.sec;
+    if (!this.all.length || this.all[0].time <= need || this.exhausted) return false;
+    if (this.ensuring) return true;
+    this.ensuring = true;
+    setStatus(`加载更早的${LABEL[this.iv]}K线...`);
+    (async () => {
+      let k = 0;
+      while (this.all[0].time > need && !this.exhausted && k++ < MAX_PAGES) {
+        if (!(await this.loadOlder())) break;
+      }
+      this.ensuring = false;
+      if (replay) { this.applyReplay(); setStatus('⏸ 固定时间: ' + fmtTime(replayT) + '  (往右拖最小周期, 时间往后走)'); }
+    })();
+    return true;
+  }
+
   applyReplay() {
+    if (this.ensureHistory() && (this.all[0].time >= replayT || this.ensuring)) return;   // 正在补数据, 先不动画面
     if (this.replayed()) {
-      this.bars = this.cutBars(replayT);
-      if (!this.bars.length) return;
+      const cut = this.cutBars(replayT);
+      if (!cut.length) return;
+      this.bars = cut;
       this.applyData();
       this.pin();
       this.showLegend(this.bars[this.bars.length - 1]);
