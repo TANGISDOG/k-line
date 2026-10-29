@@ -18,6 +18,8 @@
     没走完的那根用最小周期K线现场拼出来; 往右拖最小周期, 大周期K线一点点长出来; 大周期最右边始终对齐当前时间
   - 本地缓存: 拿到过的K线(含成交额)存在这台电脑浏览器的 IndexedDB 里, 以后先读本地, 只向币安要最新那一段;
     "⬇下载历史"一次把当前合约各周期的历史存到本地。所有请求统一限速(每0.3秒最多1个), 被币安限流时全部暂停到解封
+  - 持仓量: 每个窗口最下面一条橙色曲线, 取每根K线收盘那一刻的持仓量(复盘时取"当前时间"那一刻);
+    从Mac看盘服务打开时读Mac数据库(5分钟一个点), 从GitHub打开时直接问币安(只有最近一段)
   用法: 直接双击用浏览器打开; 也可以带参数 mtf_chart.html?symbol=ain
   注意: 跟其他脚本一样,需要能访问 fapi.binance.com(VPN开着)
 -->
@@ -64,7 +66,7 @@ body.measuring .chart{cursor:crosshair}
 </head>
 <body>
 <header>
-  <b>多周期联动</b>
+  <b>多周期联动</b><span id="src" style="color:var(--muted);font-size:12px"></span>
   <input id="sym" placeholder="合约,如 AIN" autocomplete="off">
   <button id="go">打开</button>
   <button id="layout">竖排</button>
@@ -149,7 +151,10 @@ function toBar(k) {
   return {time: Math.floor(k[0] / 1000) + TZ, open: +k[1], high: +k[2], low: +k[3], close: +k[4], value: +k[7]};
 }
 // ---------- 请求币安: 统一限速 + 被封时暂停 ----------
-const REQ_GAP = 300;                     // 每次请求至少间隔0.3秒(币安大约每分钟240次大批量K线请求就会限流)
+// 从本机记录器打开(http://127.0.0.1:8899)时, K线从本机数据库读, 不直接问币安, 也不用限速
+const LOCAL = location.port === '8899';   // 从记录器的看盘服务打开(本机或通过Tailscale): 数据都从那台电脑读
+const LOCAL_PATH = {'/fapi/v1/klines': '/api/klines', '/fapi/v1/ticker/price': '/api/price'};
+const REQ_GAP = LOCAL ? 0 : 300;         // 每次请求至少间隔0.3秒(币安大约每分钟240次大批量K线请求就会限流)
 let reqChain = Promise.resolve(), lastReq = 0, bannedUntil = 0;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function apiGet(path, params) {
@@ -161,7 +166,7 @@ function apiGet(path, params) {
     const wait = lastReq + REQ_GAP - Date.now();
     if (wait > 0) await sleep(wait);
     lastReq = Date.now();
-    const r = await fetch(`${API}${path}?${new URLSearchParams(params)}`);
+    const r = await fetch(`${LOCAL && LOCAL_PATH[path] ? LOCAL_PATH[path] : API + path}?${new URLSearchParams(params)}`);
     if (r.status === 418 || r.status === 429) {      // 被限流: 记下解封时间, 之后所有请求都先等
       const txt = await r.text(), m = txt.match(/until (\d{13})/);
       bannedUntil = m ? +m[1] : Date.now() + 1000 * (+r.headers.get('Retry-After') || 60);
@@ -317,14 +322,18 @@ class Pane {
       crosshair: {mode: LightweightCharts.CrosshairMode.Normal,
                   vertLine: {color: '#aab2bd', labelBackgroundColor: '#5e6673'},
                   horzLine: {color: '#6b7380', labelBackgroundColor: '#5e6673'}},
-      rightPriceScale: {borderColor: '#2b3139', scaleMargins: {top: 0.06, bottom: 0.24}, mode: scaleMode()},
+      rightPriceScale: {borderColor: '#2b3139', scaleMargins: {top: 0.06, bottom: 0.34}, mode: scaleMode()},
       timeScale: {borderColor: '#2b3139', timeVisible: true, secondsVisible: false, rightOffset: RIGHT_PAD},
     });
     this.ts = this.chart.timeScale();
     this.candle = this.chart.addCandlestickSeries({
       upColor: '#0ecb81', downColor: '#f6465d', borderVisible: false, wickUpColor: '#0ecb81', wickDownColor: '#f6465d'});
     this.vol = this.chart.addHistogramSeries({priceFormat: {type: 'volume'}, priceScaleId: '', lastValueVisible: false, priceLineVisible: false});
-    this.vol.priceScale().applyOptions({scaleMargins: {top: 0.8, bottom: 0}});
+    this.vol.priceScale().applyOptions({scaleMargins: {top: 0.68, bottom: 0.16}});
+    // 持仓量: 成交额下面一条橙色曲线(自己一个刻度, 不显示刻度轴)
+    this.oi = this.chart.addLineSeries({color: '#f0b90b', lineWidth: 1, priceScaleId: 'oi', priceFormat: {type: 'volume'},
+      priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: true});
+    this.oi.priceScale().applyOptions({scaleMargins: {top: 0.86, bottom: 0.02}});
 
     this.ts.subscribeVisibleLogicalRangeChange(lr => this.onRange(lr));
     this.chart.subscribeCrosshairMove(p => this.onCross(p));
@@ -336,6 +345,26 @@ class Pane {
   applyData() {
     this.candle.setData(this.bars);
     this.vol.setData(this.bars.map(b => this.volBar(b)));
+    this.renderOI();
+  }
+
+  // 这根K线收盘那一刻的持仓量(复盘时大周期取"当前时间"那一刻, 不剧透); 没数据返回 null
+  oiForBar(b) {
+    if (!oiPts.length) return null;
+    let end = (b.time - TZ + this.sec) * 1000;
+    if (this.replayed() && replayT != null) end = Math.min(end, (replayT - TZ) * 1000);
+    if (oiPts[0][0] > end) return null;
+    let lo = 0, hi = oiPts.length - 1;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (oiPts[m][0] <= end) lo = m; else hi = m - 1; }
+    if (oiPts[lo][0] < (b.time - TZ) * 1000 - Math.max(this.sec, 300) * 1000) return null;   // 太旧的点不用, 免得空白段被拉成直线
+    return oiPts[lo][1];
+  }
+  renderOI() {
+    this.oi.setData(this.bars.map(b => { const v = this.oiForBar(b); return v == null ? {time: b.time} : {time: b.time, value: v}; }));
+  }
+  updateOILast() {
+    const b = this.bars[this.bars.length - 1], v = b && this.oiForBar(b);
+    if (v != null) this.oi.update({time: b.time, value: v});
   }
 
   async load() {
@@ -552,7 +581,8 @@ class Pane {
     const chg = (b.close / b.open - 1) * 100, amp = b.low > 0 ? (b.high - b.low) / b.low * 100 : 0;
     const cls = chg >= 0 ? 'up' : 'down';
     this.legendEl.innerHTML = `${fmtTime(b.time)}  开 ${f(b.open)} 高 ${f(b.high)} 低 ${f(b.low)} 收 <span class="${cls}">${f(b.close)}</span>`
-      + `  <span class="${cls}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>  振幅 ${amp.toFixed(2)}%  额 ${fmtVol(b.value)}`;
+      + `  <span class="${cls}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>  振幅 ${amp.toFixed(2)}%  额 ${fmtVol(b.value)}`
+      + (() => { const v = this.oiForBar(b); return v == null ? '' : `  <span style="color:#f0b90b">仓 ${fmtVol(v)}</span>`; })();
   }
 
   // WebSocket推过来的最新K线
@@ -563,6 +593,7 @@ class Pane {
     if (this.bars !== a) return;                    // 固定时间模式下大周期不显示最新的
     this.candle.update(b);
     this.vol.update(this.volBar(b));
+    this.updateOILast();
   }
 
   // 信息栏默认显示哪根: 平时是最新那根; 固定时间模式下基准周期显示"当前时间"那根(不剧透后面)
@@ -663,6 +694,7 @@ class Pane {
       if (sameHead && n >= 2) {                      // 前面都没变(时间只往前走了一点): 只更新最后一根, 快很多
         this.candle.update(cut[n - 1]);
         this.vol.update(this.volBar(cut[n - 1]));
+        this.updateOILast();
       } else this.applyData();
       this.pin();
       this.showLegend(this.bars[this.bars.length - 1]);
@@ -671,11 +703,48 @@ class Pane {
       if (this.iv !== replayIv || active !== this) this.alignRight(replayT);
       // 基准周期右边还有"未来"的K线(往右拖才能前进), 把最新价那条线/标签藏起来, 信息栏显示当前时间那根
       this.candle.applyOptions({lastValueVisible: false, priceLineVisible: false});
+      this.oi.applyOptions({lastValueVisible: false});
       const b = this.barAt(replayT - this.sec);
       if (b && this.crossT == null) this.showLegend(b);
     }
   }
 }
+
+// ---------- 持仓量 ----------
+let oiPts = [], oiSym = '';                  // [[时间ms, 持仓量], ...] 按时间排好
+async function loadOI() {
+  const sym = symbol;
+  oiPts = []; oiSym = '';
+  try {
+    let rows;
+    if (LOCAL) rows = (await (await fetch(`/api/oi?symbol=${sym}&startTime=0`)).json()).map(r => [r[0], r[1]]);
+    else {                                   // 直接问币安: 1小时的最近500个点 + 5分钟的最近500个点, 合起来
+      const h = await apiGet('/futures/data/openInterestHist', {symbol: sym, period: '1h', limit: 500});
+      const m = await apiGet('/futures/data/openInterestHist', {symbol: sym, period: '5m', limit: 500});
+      const map = new Map();
+      for (const x of h.concat(m)) map.set(+x.timestamp, +x.sumOpenInterest);
+      rows = [...map].sort((a, b) => a[0] - b[0]);
+    }
+    if (sym !== symbol) return;
+    oiPts = rows; oiSym = sym;
+    panes.forEach(p => { if (p.bars.length) { p.renderOI(); p.showLegend(p.crossT != null ? p.barAt(p.crossT) : p.nowBar()); } });
+  } catch (e) { console.warn('持仓量加载失败', e); }
+}
+async function refreshOI() {                 // 每分钟补一次最新的持仓量
+  if (!symbol || oiSym !== symbol) return;
+  try {
+    if (LOCAL) {
+      const last = oiPts.length ? oiPts[oiPts.length - 1][0] : 0;
+      const rows = await (await fetch(`/api/oi?symbol=${symbol}&startTime=${last + 1}`)).json();
+      rows.forEach(r => oiPts.push([r[0], r[1]]));
+    } else {
+      const d = await apiGet('/fapi/v1/openInterest', {symbol});
+      oiPts.push([+d.time || Date.now(), +d.openInterest]);
+    }
+    if (!replay) panes.forEach(p => p.updateOILast());
+  } catch {}
+}
+setInterval(refreshOI, 60000);
 
 function connectWs() {
   if (ws) { ws.onclose = null; ws.close(); }
@@ -708,6 +777,7 @@ async function openSymbol(raw) {
     pxFmt = makePxFmt(+px.price);
     await Promise.all(panes.map(p => p.load()));
     fineCache.clear();
+    loadOI();
     setStatus('');
     if (replay) setReplay(true, fromRemote);
   } catch (e) {
@@ -751,6 +821,7 @@ function setReplay(on, remote) {
     panes.forEach(p => {
       if (p.bars !== p.all) { p.bars = p.all; p.applyData(); }
       p.candle.applyOptions({lastValueVisible: true, priceLineVisible: true});
+      p.oi.applyOptions({lastValueVisible: true});
       p.showLegend(p.bars[p.bars.length - 1]);
     });
     if (!remote) post({t: 'replay', on: false});
@@ -823,6 +894,7 @@ function setLayout(mode) {
 }
 
 // ---- 启动 ----
+$('src').textContent = LOCAL ? (/^(127\.0\.0\.1|localhost)$/.test(location.hostname) ? ' · 本机数据' : ' · 读取Mac数据') : '';
 logScale = store.get('log', true);
 const ivs = TF.length ? TF : store.get('ivs', ['1h', '15m', '5m']);
 panes = ivs.map((iv, i) => new Pane(SEC[iv] ? iv : ['1h', '15m', '5m'][i], i));
