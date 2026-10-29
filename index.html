@@ -18,7 +18,8 @@
     没走完的那根用最小周期K线现场拼出来; 往右拖最小周期, 大周期K线一点点长出来; 大周期最右边始终对齐当前时间
   - 本地缓存: 拿到过的K线(含成交额)存在这台电脑浏览器的 IndexedDB 里, 以后先读本地, 只向币安要最新那一段;
     "⬇下载历史"一次把当前合约各周期的历史存到本地。所有请求统一限速(每0.3秒最多1个), 被币安限流时全部暂停到解封
-  - 持仓量: 每个窗口最下面一条橙色曲线, 取每根K线收盘那一刻的持仓量(复盘时取"当前时间"那一刻);
+  - 持仓量: 每个窗口最下面一排"持仓K线": 开=K线开盘时持仓, 收=收盘时持仓, 高低=期间最高最低, 增加绿/减少红
+    (复盘时正在走的那根截到"当前时间");
     从Mac看盘服务打开时读Mac数据库(5分钟一个点), 从GitHub打开时直接问币安(只有最近一段)
   用法: 直接双击用浏览器打开; 也可以带参数 mtf_chart.html?symbol=ain
   注意: 跟其他脚本一样,需要能访问 fapi.binance.com(VPN开着)
@@ -322,18 +323,19 @@ class Pane {
       crosshair: {mode: LightweightCharts.CrosshairMode.Normal,
                   vertLine: {color: '#aab2bd', labelBackgroundColor: '#5e6673'},
                   horzLine: {color: '#6b7380', labelBackgroundColor: '#5e6673'}},
-      rightPriceScale: {borderColor: '#2b3139', scaleMargins: {top: 0.06, bottom: 0.34}, mode: scaleMode()},
+      rightPriceScale: {borderColor: '#2b3139', scaleMargins: {top: 0.06, bottom: 0.3}, mode: scaleMode()},
       timeScale: {borderColor: '#2b3139', timeVisible: true, secondsVisible: false, rightOffset: RIGHT_PAD},
     });
     this.ts = this.chart.timeScale();
     this.candle = this.chart.addCandlestickSeries({
       upColor: '#0ecb81', downColor: '#f6465d', borderVisible: false, wickUpColor: '#0ecb81', wickDownColor: '#f6465d'});
     this.vol = this.chart.addHistogramSeries({priceFormat: {type: 'volume'}, priceScaleId: '', lastValueVisible: false, priceLineVisible: false});
-    this.vol.priceScale().applyOptions({scaleMargins: {top: 0.68, bottom: 0.16}});
-    // 持仓量: 成交额下面一条橙色曲线(自己一个刻度, 不显示刻度轴)
-    this.oi = this.chart.addLineSeries({color: '#f0b90b', lineWidth: 1, priceScaleId: 'oi', priceFormat: {type: 'volume'},
-      priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: true});
-    this.oi.priceScale().applyOptions({scaleMargins: {top: 0.86, bottom: 0.02}});
+    this.vol.priceScale().applyOptions({scaleMargins: {top: 0.72, bottom: 0.1}});
+    // 持仓量: 成交额下面一排"持仓K线"(自己一个刻度), 持仓增加绿 / 减少红
+    this.oi = this.chart.addCandlestickSeries({upColor: 'rgba(14,203,129,.75)', downColor: 'rgba(246,70,93,.75)',
+      borderVisible: false, wickUpColor: 'rgba(14,203,129,.75)', wickDownColor: 'rgba(246,70,93,.75)',
+      priceScaleId: 'oi', priceFormat: {type: 'volume'}, priceLineVisible: false, lastValueVisible: true});
+    this.oi.priceScale().applyOptions({scaleMargins: {top: 0.915, bottom: 0.005}});
 
     this.ts.subscribeVisibleLogicalRangeChange(lr => this.onRange(lr));
     this.chart.subscribeCrosshairMove(p => this.onCross(p));
@@ -348,23 +350,31 @@ class Pane {
     this.renderOI();
   }
 
-  // 这根K线收盘那一刻的持仓量(复盘时大周期取"当前时间"那一刻, 不剧透); 没数据返回 null
-  oiForBar(b) {
+  // 持仓量K线: 开=这根K线开盘时的持仓, 收=收盘时的持仓, 高低=期间最高最低(复盘时大周期截到"当前时间"); 没数据返回 null
+  oiCandle(b) {
     if (!oiPts.length) return null;
-    let end = (b.time - TZ + this.sec) * 1000;
+    const start = (b.time - TZ) * 1000;
+    let end = start + this.sec * 1000;
     if (this.replayed() && replayT != null) end = Math.min(end, (replayT - TZ) * 1000);
-    if (oiPts[0][0] > end) return null;
-    let lo = 0, hi = oiPts.length - 1;
-    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (oiPts[m][0] <= end) lo = m; else hi = m - 1; }
-    if (oiPts[lo][0] < (b.time - TZ) * 1000 - Math.max(this.sec, 300) * 1000) return null;   // 太旧的点不用, 免得空白段被拉成直线
-    return oiPts[lo][1];
+    const upto = t => { let lo = 0, hi = oiPts.length - 1;           // 最后一个 <= t 的点
+      if (oiPts[0][0] > t) return -1;
+      while (lo < hi) { const m = (lo + hi + 1) >> 1; if (oiPts[m][0] <= t) lo = m; else hi = m - 1; }
+      return lo; };
+    const ie = upto(end);
+    if (ie < 0 || oiPts[ie][0] < start - Math.max(this.sec, 300) * 1000) return null;   // 太旧的点不用
+    const is = upto(start);
+    const open = is >= 0 && oiPts[is][0] >= start - Math.max(this.sec, 300) * 1000 ? oiPts[is][1] : oiPts[is + 1][1];
+    let high = Math.max(open, oiPts[ie][1]), low = Math.min(open, oiPts[ie][1]);
+    for (let i = Math.max(is + 1, 0); i <= ie; i++) { const v = oiPts[i][1]; if (v > high) high = v; if (v < low) low = v; }
+    return {time: b.time, open, high, low, close: oiPts[ie][1]};
   }
+  oiForBar(b) { const c = this.oiCandle(b); return c ? c.close : null; }
   renderOI() {
-    this.oi.setData(this.bars.map(b => { const v = this.oiForBar(b); return v == null ? {time: b.time} : {time: b.time, value: v}; }));
+    this.oi.setData(this.bars.map(b => this.oiCandle(b) || {time: b.time}));
   }
   updateOILast() {
-    const b = this.bars[this.bars.length - 1], v = b && this.oiForBar(b);
-    if (v != null) this.oi.update({time: b.time, value: v});
+    const b = this.bars[this.bars.length - 1], c = b && this.oiCandle(b);
+    if (c) this.oi.update(c);
   }
 
   async load() {
