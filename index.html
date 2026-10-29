@@ -167,7 +167,7 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
 
 <script>
 const API = 'https://fapi.binance.com';
-const WS = 'wss://fstream.binance.com/stream?streams=';
+const WS = 'wss://fstream.binance.com/market/stream?streams=';   // 币安2026年把行情推送挪到了 /market (旧地址能连上但不推数据)
 const TZ = -new Date().getTimezoneOffset() * 60;   // 图表库按UTC显示,整体平移成本地时间
 const SEC = {'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'12h':43200,'1d':86400};
 const LABEL = {'1m':'1分钟','3m':'3分钟','5m':'5分钟','15m':'15分钟','30m':'30分钟','1h':'1小时','2h':'2小时','4h':'4小时','6h':'6小时','12h':'12小时','1d':'1天'};
@@ -218,7 +218,7 @@ const store = {
 };
 
 function normSym(s) {
-  s = (s || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  s = (s || '').trim().toUpperCase().replace(/[^\p{L}\p{N}]/gu, '');   // 合约名可以有中文(比如 币安人生USDT)
   if (!s) return '';
   return s.endsWith('USDT') ? s : s + 'USDT';
 }
@@ -296,7 +296,7 @@ const rowToBar = r => ({time: Math.floor(r[0] / 1000) + TZ, open: r[1], high: r[
 // 截止 endTime(毫秒, 不给=现在) 的最近 1500 根: 读两页拼起来, 走完的页基本都在本地
 async function fetchKlines(iv, endTime) {
   const end = endTime || Date.now(), pm = pageMs(iv), p1 = Math.floor(end / pm) * pm;
-  const a = await getPage(iv, p1 - pm), b = await getPage(iv, p1);
+  const [a, b] = await Promise.all([getPage(iv, p1 - pm), getPage(iv, p1)]);
   return a.concat(b).filter(r => r[0] <= end).slice(-PAGE).map(rowToBar);
 }
 
@@ -466,7 +466,11 @@ class Pane {
   get sec() { return SEC[this.iv]; }
 
   // 图表改画面要等到下一帧才生效, 这之前读到的还是旧画面; 记住刚设的, 读的时候以它为准
-  setRange(r) { this.pendingRange = r; this.ts.setVisibleLogicalRange(r); }
+  setRange(r) {
+    if (!this.bars.length || !isFinite(r.from) || !isFinite(r.to)) return;
+    this.pendingRange = r;
+    try { this.ts.setVisibleLogicalRange(r); } catch (e) { this.pendingRange = null; }   // 图表还没尺寸(窗口最小化等)时库会报错, 忽略
+  }
   range() { return this.pendingRange || this.ts.getVisibleLogicalRange(); }
 
   lineAt(y) {                                // 鼠标附近 5 像素内的横线
@@ -562,7 +566,7 @@ class Pane {
     let k = 0;
     while (this.all.length && this.all[0].time > t && !this.exhausted && k++ < MAX_PAGES) {
       if (this.loading) { await new Promise(r => setTimeout(r, 100)); continue; }
-      if (!(await this.loadOlder())) break;
+      if (!(await this.loadOlder(t))) break;
     }
   }
 
@@ -573,18 +577,32 @@ class Pane {
   }
 
   // 往前加载一页更早的K线,并保持画面不跳
-  async loadOlder() {
+  // until: 一直补到最早一根不晚于这个时间(一批最多20页); 不给: 补一页, 数据已经很多时一次补2~3页
+  // 几页拿齐了才重画一次(数据多时每次重画要几十~上百毫秒, 一页一画会一顿一顿的)
+  async loadOlder(until) {
     if (this.loading || this.exhausted || !this.all.length) return 0;
     this.loading = true;
+    const sym = symbol, iv = this.iv, head = this.all[0];
     try {
-      const older = await fetchKlines(this.iv, (this.all[0].time - TZ) * 1000 - 1);
-      if (!older.length) { this.exhausted = true; return 0; }
+      const n = this.all.length, want = until != null ? 20 : n > 30000 ? 3 : n > 10000 ? 2 : 1;
+      const chunks = [];
+      let first = head.time, got = 0;
+      for (let k = 0; k < want; k++) {
+        const older = await fetchKlines(iv, (first - TZ) * 1000 - 1);
+        if (symbol !== sym || this.iv !== iv || this.all[0] !== head) return 0;   // 中途换了合约/周期: 这批作废
+        if (!older.length) { this.exhausted = true; break; }
+        chunks.unshift(older);
+        got += older.length;
+        first = older[0].time;
+        if (until != null && first <= until) break;
+      }
+      if (!got) return 0;
       const lr = this.range();
-      this.all = older.concat(this.all);
+      this.all = chunks.flat().concat(this.all);
       this.bars = this.replayed() ? this.cutBars(replayT) : this.all;
       this.applyData();
-      if (lr) this.setRange({from: lr.from + older.length, to: lr.to + older.length});
-      return older.length;
+      if (lr) this.setRange({from: lr.from + got, to: lr.to + got});
+      return got;
     } catch (e) {
       setStatus('加载更早数据失败: ' + e.message, true);
       return 0;
@@ -635,11 +653,10 @@ class Pane {
       }
       return;
     }
-    const center = this.timeAt((lr.from + lr.to) / 2), src = this;
-    nextFrame('range', () => {                       // 拖动时这个事件一秒几十次, 合并成每帧同步一次
-      for (const p of panes) if (p !== src) p.centerOn(center);
-      post({t: 'range', c: center});
-    });
+    // 图表库每帧最多发一次这个事件, 直接同步(不再多等一帧), 别的窗口跟得更紧
+    const center = this.timeAt((lr.from + lr.to) / 2);
+    for (const p of panes) if (p !== this) p.centerOn(center);
+    post({t: 'range', c: center});
   }
 
   // 让本窗口的中心对到时间 t,保持本窗口自己的缩放; 最新那头不留大片空白
@@ -647,8 +664,9 @@ class Pane {
     this.pendingT = t;
     if (this.loading || !this.bars.length) return;
     let pages = 0;
+    const w0 = this.range(), half = (w0 ? w0.to - w0.from : INIT_BARS) / 2 * this.sec;
     while (this.pendingT < this.bars[0].time && !this.exhausted && pages++ < MAX_PAGES) {
-      if (!(await this.loadOlder())) break;
+      if (!(await this.loadOlder(this.pendingT - half))) break;
     }
     const lr = this.range();
     const w = lr ? lr.to - lr.from : INIT_BARS;
@@ -742,7 +760,8 @@ class Pane {
     const seg = this.bars.slice(i0, i1 + 1);
     if (!seg.length) { el.style.display = lab.style.display = 'none'; return; }
     const open = seg[0].open, close = seg[seg.length - 1].close;
-    const hi = Math.max(...seg.map(b => b.high)), lo = Math.min(...seg.map(b => b.low));
+    let hi = -Infinity, lo = Infinity;
+    for (const b of seg) { if (b.high > hi) hi = b.high; if (b.low < lo) lo = b.low; }
     const chg = (close / open - 1) * 100, amp = lo > 0 ? (hi - lo) / lo * 100 : 0;
     const vol = seg.reduce((a, b) => a + b.value, 0);
     const secs = seg[seg.length - 1].time + this.sec - seg[0].time;
@@ -900,7 +919,7 @@ class Pane {
           await new Promise(r => setTimeout(r, 100));
           continue;
         }
-        if (!(await this.loadOlder())) { failed = !this.exhausted; break; }
+        if (!(await this.loadOlder(need))) { failed = !this.exhausted; break; }
       }
       this.ensuring = false;
       if (failed) this.ensureRetryAt = Date.now() + 5000;
@@ -973,12 +992,22 @@ async function refreshOI() {                 // 每分钟补一次最新的持�
 }
 setInterval(refreshOI, 60000);
 
+// 实时推送看门狗: 连着却超过90秒一条都没收到(地址变了/网络半断), 就提示并重连
+let wsLastMsg = 0;
+setInterval(() => {
+  if (!ws || !symbol || document.hidden || Date.now() - wsLastMsg < 90000) return;
+  setStatus('实时行情90秒没有更新, 正在重连...', true);
+  connectWs();
+}, 30000);
 function connectWs() {
   if (ws) { ws.onclose = null; ws.close(); }
   if (!symbol) return;
   const ivs = [...new Set(panes.map(p => p.iv))];
-  ws = new WebSocket(WS + ivs.map(iv => `${symbol.toLowerCase()}@kline_${iv}`).join('/'));
+  ws = new WebSocket(WS + ivs.map(iv => `${encodeURIComponent(symbol.toLowerCase())}@kline_${iv}`).join('/'));
+  wsLastMsg = Date.now();
   ws.onmessage = e => {
+    wsLastMsg = Date.now();
+    if ($('status').textContent.startsWith('实时行情90秒')) setStatus('');
     const k = JSON.parse(e.data).data.k;
     const b = {time: Math.floor(k.t / 1000) + TZ, open: +k.o, high: +k.h, low: +k.l, close: +k.c, value: +k.q};
     for (const p of panes) if (p.iv === k.i) p.push(b);
@@ -1130,7 +1159,7 @@ async function syncLines() {                         // 从Mac取最新的线(�
   const s = symbol;
   if (!LOCAL || !s) return;
   try {
-    const r = await fetch('/api/lines?symbol=' + s, {cache: 'no-store'});
+    const r = await fetch('/api/lines?symbol=' + encodeURIComponent(s), {cache: 'no-store'});
     if (!r.ok) return;
     const v = await r.json();
     if (s !== symbol || mouseDown || Date.now() - linesSavedAt < 3000) return;   // 正在拖线/刚保存过: 以本地为准
@@ -1204,6 +1233,58 @@ function normFavs(v) {
 let favs = normFavs(store.get('favs', null)), favsSavedAt = 0;
 let favGroup = store.get('favGroup', '全部'), favSort = store.get('favSort', {k: 'chg24', dir: -1}), favTab = 'sym';
 let watchData = {}, watchTimer = null;
+// 收藏列表实时行情: 币安每个合约每秒推一次(最新价/24小时开盘价), 表格每秒更新数字, 每5秒重新排一次序
+let favLive = {}, favWs = [], favWsKey = '', favLiveAt = 0, favTick = null, favSortAt = 0;
+function favRow(s) {                                  // 合并: 快照(含UTC开盘价) + 实时推送
+  const r = {...(watchData[s] || {})}, L = favLive[s];
+  if (L) {
+    r.price = L.cs;
+    r.chg24 = L.o ? (L.c / L.o - 1) * 100 : r.chg24;
+    if (r.utcOpen) r.chgUtc = (L.c / r.utcOpen - 1) * 100;
+  }
+  return r;
+}
+function connectFavWs() {
+  const syms = [...new Set(favs.items.map(x => x.s))].sort(), key = syms.join(',');
+  if (key === favWsKey && favWs.length) return;
+  closeFavWs();
+  favWsKey = key;
+  for (let i = 0; i < syms.length; i += 150) {        // 一条连接最多放150个
+    const part = syms.slice(i, i + 150);
+    const w = new WebSocket(WS + part.map(x => `${encodeURIComponent(x.toLowerCase())}@miniTicker`).join('/'));
+    w.onmessage = e => {
+      const d = JSON.parse(e.data).data;
+      favLive[d.s] = {c: +d.c, cs: d.c, o: +d.o};
+      favLiveAt = Date.now();
+    };
+    w.onclose = () => { if (favWs.includes(w)) setTimeout(() => { if (favWs.includes(w)) { favWsKey = ''; connectFavWs(); } }, 3000); };
+    favWs.push(w);
+  }
+}
+function closeFavWs() {
+  const old = favWs; favWs = []; favWsKey = '';
+  old.forEach(w => { w.onclose = null; w.close(); });
+}
+function favLiveTick() {                              // 每秒: 只改数字, 不重建表格(不打断点击/下拉框)
+  if ($('favpanel').hidden || favTab !== 'sym') return;
+  const busy = document.activeElement && document.activeElement.closest('#fp-table select');
+  if (!busy && !mouseDown && Date.now() - favSortAt > 5000 && ['price', 'chg24', 'chgUtc'].includes(favSort.k)) {
+    favSortAt = Date.now(); renderFavTable(); return;  // 每5秒按最新数字重新排序
+  }
+  for (const tr of $('fp-table').tBodies[0].rows) {
+    const s = tr.dataset.s;
+    if (!s || !favLive[s]) continue;
+    const r = favRow(s), c = tr.cells;
+    if (c[1].textContent !== r.price) c[1].textContent = r.price;
+    setPct(c[2], r.chg24); setPct(c[3], r.chgUtc);
+  }
+}
+function setPct(td, v) {
+  if (v == null) return;
+  const t = (v >= 0 ? '+' : '') + v.toFixed(2) + '%', cls = v >= 0 ? 'up' : 'down';
+  if (td.textContent !== t) td.textContent = t;
+  if (td.className !== cls) td.className = cls;
+}
 const favHas = s => favs.items.some(x => x.s === s);
 function saveFavs() {
   store.set('favs', favs);
@@ -1241,6 +1322,7 @@ function toggleFav(s) {
   fetchWatch();
 }
 function renderFavs() {
+  if (!$('favpanel').hidden) connectFavWs();
   $('star').classList.toggle('on', favHas(symbol));
   $('star').textContent = favHas(symbol) ? '★' : '☆';
   if ($('favpanel').hidden) return;
@@ -1254,7 +1336,8 @@ function renderFavGroups() {
 }
 const pctCell = v => v == null ? '<td>-</td>' : `<td class="${v >= 0 ? 'up' : 'down'}">${v >= 0 ? '+' : ''}${v.toFixed(2)}%</td>`;
 function renderFavTable() {
-  const rows = favs.items.filter(x => favGroup === '全部' || x.g === favGroup).map(x => ({...x, ...(watchData[x.s] || {})}));
+  const rows = favs.items.filter(x => favGroup === '全部' || x.g === favGroup).map(x => ({...x, ...favRow(x.s)}));
+  favSortAt = Date.now();
   const k = favSort.k, dir = favSort.dir;
   const val = r => k === 's' ? r.s : k === 'price' ? (r.price != null ? +r.price : null) : r[k];
   rows.sort((a, b) => {
@@ -1283,7 +1366,7 @@ async function fetchWatch() {                        // 收藏合约的最新价
   try {
     let rows;
     if (LOCAL) {
-      const r = await fetch('/api/watch?symbols=' + syms.join(','), {cache: 'no-store'});
+      const r = await fetch('/api/watch?symbols=' + encodeURIComponent(syms.join(',')), {cache: 'no-store'});
       if (!r.ok) throw new Error(r.status);
       rows = await r.json();
     } else {                                          // GitHub版: 直接问币安
@@ -1296,10 +1379,11 @@ async function fetchWatch() {                        // 收藏合约的最新价
         if (!t) { rows.push({symbol: s, missing: true}); continue; }
         const k = await apiGet('/fapi/v1/klines', {symbol: s, interval: '1d', limit: 1});
         const o = k[0] && k[0][0] === day0 ? +k[0][1] : 0;
-        rows.push({symbol: s, price: t.lastPrice, chg24: +t.priceChangePercent, chgUtc: o ? (t.lastPrice / o - 1) * 100 : null});
+        rows.push({symbol: s, price: t.lastPrice, chg24: +t.priceChangePercent, utcOpen: o || null, chgUtc: o ? (t.lastPrice / o - 1) * 100 : null});
       }
     }
     watchData = Object.fromEntries(rows.map(r => [r.symbol, r]));
+    if (document.activeElement && document.activeElement.closest('#fp-table select')) return;   // 正在选分组: 先不刷新表格, 免得下拉框被关掉
     renderFavTable();
   } catch (e) { setStatus('收藏行情刷新失败: ' + e.message, true); }
 }
@@ -1329,8 +1413,17 @@ async function jumpSeg(bm, remote) {                 // 三个周期一起跳到
 function showFavPanel(on) {
   $('favpanel').hidden = !on;
   $('favbtn').classList.toggle('on', on);
-  clearInterval(watchTimer);
-  if (on) { renderFavs(); fetchWatch(); syncFavs(); watchTimer = setInterval(() => { if (!document.hidden) fetchWatch(); }, LOCAL ? 10000 : 20000); }
+  clearInterval(watchTimer); clearInterval(favTick);
+  if (on) {
+    renderFavs(); fetchWatch(); syncFavs(); connectFavWs();
+    let n = 0;
+    watchTimer = setInterval(() => {                 // 快照: 平时每60秒(主要为UTC开盘价); 实时推送断了就每5秒
+      n += 5;
+      if (document.hidden) return;
+      if (Date.now() - favLiveAt > 10000 || n % 60 === 0) fetchWatch();
+    }, 5000);
+    favTick = setInterval(favLiveTick, 1000);
+  } else closeFavWs();
 }
 function setFavTab(t) {
   favTab = t;
