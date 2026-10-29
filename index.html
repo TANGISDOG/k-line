@@ -135,7 +135,7 @@ let replay = false, replayT = null, replayIv = null;   // 固定时间(复盘): 
 const fineCache = new Map();                              // 拼"没走完的大周期K线"用的小周期K线缓存
 let measureMode = false;   // 📏测量 打开后, 直接拖动就是测量(不打开时按住 Shift 拖动)
 addEventListener('pointerdown', () => { mouseDown = true; }, true);
-addEventListener('pointerup', () => { mouseDown = false; }, true);
+addEventListener('pointerup', () => { mouseDown = false; if (replay) setTimeout(refreshReplay, 0); }, true);   // 松手后把大周期右边重新钉好
 addEventListener('pointercancel', () => { mouseDown = false; }, true);
 let lastWheel = 0, lastWheelPan = false;
 // 滚轮: 上下滚/双指捏合 = 缩放; 触控板左右滑 = 平移(固定时间模式下要区分: 平移才让时间前进, 缩放不能露出未来)
@@ -391,11 +391,15 @@ class Pane {
       priceScaleId: 'oi', priceFormat: {type: 'volume'}, priceLineVisible: false, lastValueVisible: true});
     this.oi.priceScale().applyOptions({scaleMargins: {top: 0.915, bottom: 0.005}});
 
-    this.ts.subscribeVisibleLogicalRangeChange(lr => this.onRange(lr));
+    this.ts.subscribeVisibleLogicalRangeChange(lr => { this.pendingRange = null; this.onRange(lr); });
     this.chart.subscribeCrosshairMove(p => this.onCross(p));
   }
 
   get sec() { return SEC[this.iv]; }
+
+  // 图表改画面要等到下一帧才生效, 这之前读到的还是旧画面; 记住刚设的, 读的时候以它为准
+  setRange(r) { this.pendingRange = r; this.ts.setVisibleLogicalRange(r); }
+  range() { return this.pendingRange || this.ts.getVisibleLogicalRange(); }
 
   lineAt(y) {                                // 鼠标附近 5 像素内的横线
     let best = null, bd = 6;
@@ -450,14 +454,14 @@ class Pane {
     if (pxFmt) this.candle.applyOptions({priceFormat: pxFmt});
     this.applyData();
     const n = this.bars.length;
-    this.ts.setVisibleLogicalRange({from: n - INIT_BARS, to: n - 1 + RIGHT_PAD});
+    this.setRange({from: n - INIT_BARS, to: n - 1 + RIGHT_PAD});
     this.showLegend(this.bars[n - 1]);
   }
 
   async changeInterval(iv) {
-    const lr = active && active !== this && active.ts.getVisibleLogicalRange();
+    const lr = active && active !== this && active.range();
     // 记住本窗口最右边的时间: 换周期后最右边还是这个时间(原来就在最新的, 换完也在最新)
-    const own = this.bars.length && this.ts.getVisibleLogicalRange();
+    const own = this.bars.length && this.range();
     const keepT = own && own.to < this.bars.length - 1 ? this.timeAt(own.to) : null;
     const keepW = own ? own.to - own.from : INIT_BARS;
     this.iv = iv;
@@ -467,11 +471,17 @@ class Pane {
     if (replay) this.pinUntil = Infinity;            // 固定时间模式: 加载时画面会先到最新, 别让它改掉固定的时间
     try { await this.load(); setStatus(''); } catch (e) { setStatus('加载失败: ' + e.message, true); return; }
     finally { if (this.pinUntil === Infinity) this.pinUntil = 0; }
-    if (replay) {                                    // 固定时间不变, 基准换成现在最小的周期
+    if (replay) {                                    // 固定时间不变, 基准换成现在最小的周期; 显示根数也不变
       replayT = T0;
       replayIv = panes.slice().sort((a, b) => a.sec - b.sec)[0].iv;
       post({t: 'replay', on: true, T: replayT, iv: replayIv});
+      await this.loadUntil(replayT - keepW * this.sec);
+      const n = this.bars.length;
+      this.pinUntil = Date.now() + 300;
+      this.setRange({from: n - keepW, to: n});
       refreshReplay();
+      if (!this.replayed()) this.alignRight(replayT, keepW);   // 自己是基准: 右边对到固定时间, 不露出后面的K线
+      this.pinUntil = Date.now() + 300;
       connectWs();
       return;
     }
@@ -480,14 +490,18 @@ class Pane {
     connectWs();
   }
 
-  async showRightAt(T, w) {                         // 把时间 T 放到最右边, 显示 w 根; 历史不够先往前补
+  async loadUntil(t) {                              // 往前补历史, 直到最早一根不晚于 t
     let k = 0;
-    while (this.all[0].time > T - w * this.sec && !this.exhausted && k++ < MAX_PAGES) {
+    while (this.all.length && this.all[0].time > t && !this.exhausted && k++ < MAX_PAGES) {
       if (this.loading) { await new Promise(r => setTimeout(r, 100)); continue; }
       if (!(await this.loadOlder())) break;
     }
+  }
+
+  async showRightAt(T, w) {                         // 把时间 T 放到最右边, 显示 w 根; 历史不够先往前补
+    await this.loadUntil(T - w * this.sec);
     const to = this.indexOf(T);
-    this.ts.setVisibleLogicalRange({from: to - w, to});
+    this.setRange({from: to - w, to});
   }
 
   // 往前加载一页更早的K线,并保持画面不跳
@@ -497,11 +511,11 @@ class Pane {
     try {
       const older = await fetchKlines(this.iv, (this.all[0].time - TZ) * 1000 - 1);
       if (!older.length) { this.exhausted = true; return 0; }
-      const lr = this.ts.getVisibleLogicalRange();
+      const lr = this.range();
       this.all = older.concat(this.all);
       this.bars = this.replayed() ? this.cutBars(replayT) : this.all;
       this.applyData();
-      if (lr) this.ts.setVisibleLogicalRange({from: lr.from + older.length, to: lr.to + older.length});
+      if (lr) this.setRange({from: lr.from + older.length, to: lr.to + older.length});
       return older.length;
     } catch (e) {
       setStatus('加载更早数据失败: ' + e.message, true);
@@ -534,7 +548,17 @@ class Pane {
     if (lr.from < PREFETCH_BARS) this.loadOlder();   // 离左边还有一段就提前加载, 拖到头时不用停下来等
     if (!userMoving()) return;
     if (replay) {
-      if (this.replayed()) this.pin();               // 大周期: 只能缩放, 右边始终钉在当前时间
+      if (this.replayed()) {                         // 大周期
+        if (mouseDown || lastWheelPan) {             // 拖动/平移: 它的右边就是新的"当前时间", 其他周期跟着走
+          const T = Math.min(this.timeAt(Math.floor(lr.to)) + this.sec, Math.floor(Date.now() / 1000) + TZ);
+          if (T !== replayT) {
+            replayT = T;
+            // 正在拖的这个先不重画(重画会挪动它的画面, 时间又跟着变, 越滚越远), 松手后再截好钉好
+            nextFrame('replay', () => { refreshReplay(this); post({t: 'replay', on: true, T: replayT, iv: replayIv}); });
+          }
+          if (!mouseDown) { clearTimeout(this.reTimer); this.reTimer = setTimeout(refreshReplay, 450); }   // 触控板平移: 停下后再截好钉好
+        } else this.pin();                           // 缩放: 右边始终钉在当前时间
+      }
       else if (!mouseDown && !lastWheelPan) this.alignRight(replayT);   // 基准在缩放: 右边钉住, 只缩放左边, 不露出未来
       else {                                         // 基准在拖动/平移: 它的右边就是"当前时间"
         replayIv = this.iv;
@@ -558,12 +582,12 @@ class Pane {
     while (this.pendingT < this.bars[0].time && !this.exhausted && pages++ < MAX_PAGES) {
       if (!(await this.loadOlder())) break;
     }
-    const lr = this.ts.getVisibleLogicalRange();
+    const lr = this.range();
     const w = lr ? lr.to - lr.from : INIT_BARS;
     const c = this.indexOf(this.pendingT), maxTo = this.bars.length - 1 + RIGHT_PAD;
     let from = c - w / 2, to = c + w / 2;
     if (to > maxTo) { from -= to - maxTo; to = maxTo; }
-    this.ts.setVisibleLogicalRange({from, to});
+    this.setRange({from, to});
   }
 
   barAt(t) {
@@ -592,7 +616,7 @@ class Pane {
       await this.centerOn(t);
       if (this.crossT !== t) return;
     } else if (!mouseDown && !replay) {
-      const lr = this.ts.getVisibleLogicalRange(), i = this.indexOf(t);
+      const lr = this.range(), i = this.indexOf(t);
       if (lr && (i < lr.from + 1 || i > lr.to - 1)) this.centerOn(t);
     }
     this.drawCross();
@@ -706,7 +730,7 @@ class Pane {
   replayed() { return replay && replayIv && this.sec > SEC[replayIv]; }   // 比基准周期大的才截断
 
   rightEdgeT() {                                    // 画面最右边那根K线的收盘时刻
-    const lr = this.ts.getVisibleLogicalRange(), n = this.all.length;
+    const lr = this.range(), n = this.all.length;
     const i = Math.max(0, Math.min(n - 1, Math.floor(lr ? lr.to : n - 1)));
     return this.all[i].time + this.sec;
   }
@@ -745,21 +769,21 @@ class Pane {
   }
 
   pin() {                                           // 保持缩放, 把最右边钉在最后一根(当前时间)
-    const lr = this.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS, n = this.bars.length;
+    const lr = this.range(), w = lr ? lr.to - lr.from : INIT_BARS, n = this.bars.length;
     this.pinUntil = Date.now() + 120;
-    this.ts.setVisibleLogicalRange({from: n + 1 - w, to: n + 1});
+    this.setRange({from: n + 1 - w, to: n + 1});
   }
 
-  alignRight(T) {                                   // 跟基准一样细或更细的周期: 不截断, 只把右边对到 T
-    const lr = this.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS;
+  alignRight(T, w) {                                // 跟基准一样细或更细的周期: 不截断, 只把右边对到 T
+    if (w == null) { const lr = this.range(); w = lr ? lr.to - lr.from : INIT_BARS; }
     const to = this.indexOf(T) - 0.5;              // 正好到 T 之前那根的右边, 一点"未来"都不露
     this.pinUntil = Date.now() + 120;
-    this.ts.setVisibleLogicalRange({from: to - w, to});
+    this.setRange({from: to - w, to});
   }
 
   // 固定时间退到了本窗口已加载数据之前: 先往前补加载历史K线(补够前面一屏), 补完再重新截断显示
   ensureHistory() {
-    const lr = this.ts.getVisibleLogicalRange(), w = Math.max(50, lr ? lr.to - lr.from : INIT_BARS);
+    const lr = this.range(), w = Math.max(50, lr ? lr.to - lr.from : INIT_BARS);
     const need = replayT - w * this.sec;
     if (!this.all.length || this.all[0].time <= need || this.exhausted) return false;
     if (this.ensuring) return true;
@@ -900,9 +924,9 @@ function setScale(log) {
 }
 
 // ---- 固定时间(复盘) ----
-function refreshReplay() {
+function refreshReplay(skip) {
   if (!replay || replayT == null) return;
-  panes.forEach(p => p.all.length && p.applyReplay());
+  panes.forEach(p => p !== skip && p.all.length && p.applyReplay());
   setStatus('⏸ 固定时间: ' + fmtTime(replayT) + '  (往右拖最小周期, 时间往后走)');
 }
 function setReplay(on, remote) {
@@ -1100,9 +1124,9 @@ $('layout').onclick = () => setLayout($('grid').className === 'cols' ? 'rows' : 
 $('latest').onclick = () => {
   panes.forEach(p => {
     if (p.bars !== p.all) { p.bars = p.all; p.applyData(); }
-    const n = p.bars.length, lr = p.ts.getVisibleLogicalRange(), w = lr ? lr.to - lr.from : INIT_BARS;
+    const n = p.bars.length, lr = p.range(), w = lr ? lr.to - lr.from : INIT_BARS;
     p.pinUntil = Date.now() + 120;
-    p.ts.setVisibleLogicalRange({from: n - 0.5 - w, to: n - 0.5});
+    p.setRange({from: n - 0.5 - w, to: n - 0.5});
   });
   if (replay) setTimeout(() => setReplay(true), 150);   // 固定时间模式: 当前时间回到最新
 };
