@@ -89,7 +89,19 @@ const WS = 'wss://fstream.binance.com/stream?streams=';
 const TZ = -new Date().getTimezoneOffset() * 60;   // 图表库按UTC显示,整体平移成本地时间
 const SEC = {'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'12h':43200,'1d':86400};
 const LABEL = {'1m':'1分钟','3m':'3分钟','5m':'5分钟','15m':'15分钟','30m':'30分钟','1h':'1小时','2h':'2小时','4h':'4小时','6h':'6小时','12h':'12小时','1d':'1天'};
-const PAGE = 1500;          // 币安一次最多给1500根
+const PAGE = 1500;
+const PREFETCH_BARS = 300;  // 离左边还剩多少根就提前加载更早的K线
+const frameJobs = new Map();
+function nextFrame(key, fn) {           // 同一件事一帧只做一次(拖动时事件很密, 合并掉)
+  const had = frameJobs.has(key);
+  frameJobs.set(key, fn);
+  if (!had) requestAnimationFrame(() => { const f = frameJobs.get(key); frameJobs.delete(key); f && f(); });
+}
+function lowerBound(arr, t) {           // 第一根 time >= t 的序号(K线按时间排好序)
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m].time < t) lo = m + 1; else hi = m; }
+  return lo;
+}          // 币安一次最多给1500根
 const MAX_PAGES = 40;       // 为了对齐时间最多往前补多少页
 const INIT_BARS = 200;      // 打开时每个窗口显示多少根
 const RIGHT_PAD = 5;
@@ -297,7 +309,7 @@ class Pane {
     this.renderMeasure();
     if (Date.now() < this.pinUntil) return;          // 固定时间模式下程序自己钉右边引起的变化, 不处理
     if (active !== this || !lr || !this.bars.length) return;
-    if (lr.from < 20) this.loadOlder();
+    if (lr.from < PREFETCH_BARS) this.loadOlder();   // 离左边还有一段就提前加载, 拖到头时不用停下来等
     if (!userMoving()) return;
     if (replay) {
       if (this.replayed()) this.pin();               // 大周期: 只能缩放, 右边始终钉在当前时间
@@ -305,14 +317,15 @@ class Pane {
       else {                                         // 基准在拖动/平移: 它的右边就是"当前时间"
         replayIv = this.iv;
         replayT = this.rightEdgeT();
-        refreshReplay();
-        post({t: 'replay', on: true, T: replayT, iv: replayIv});
+        nextFrame('replay', () => { refreshReplay(); post({t: 'replay', on: true, T: replayT, iv: replayIv}); });
       }
       return;
     }
-    const center = this.timeAt((lr.from + lr.to) / 2);
-    for (const p of panes) if (p !== this) p.centerOn(center);
-    post({t: 'range', c: center});
+    const center = this.timeAt((lr.from + lr.to) / 2), src = this;
+    nextFrame('range', () => {                       // 拖动时这个事件一秒几十次, 合并成每帧同步一次
+      for (const p of panes) if (p !== src) p.centerOn(center);
+      post({t: 'range', c: center});
+    });
   }
 
   // 让本窗口的中心对到时间 t,保持本窗口自己的缩放; 最新那头不留大片空白
@@ -353,7 +366,7 @@ class Pane {
   async followCross(t, srcSec) {
     this.crossT = t;
     this.band = srcSec > this.sec ? {from: t, to: t + srcSec} : null;
-    if (t < this.bars[0].time && !this.exhausted && !replay) {
+    if (t < this.bars[0].time && !this.exhausted && !replay && !mouseDown) {
       await this.centerOn(t);
       if (this.crossT !== t) return;
     } else if (!mouseDown && !replay) {
@@ -476,16 +489,16 @@ class Pane {
 
   // 截到时间 T: 走完的照常显示, 正在走的那根用小周期K线拼出 T 那一刻的样子
   cutBars(T) {
-    const out = [];
-    for (const b of this.all) {
-      if (b.time + this.sec <= T) { out.push(b); continue; }
-      if (b.time < T) {
-        const seg = this.fineBars(b.time).filter(f => f.time >= b.time && f.time < T);
-        if (seg.length) out.push({time: b.time, open: seg[0].open, close: seg[seg.length - 1].close,
-          high: Math.max(...seg.map(f => f.high)), low: Math.min(...seg.map(f => f.low)),
-          value: seg.reduce((x, f) => x + f.value, 0)});
+    const a = this.all, k = lowerBound(a, T - this.sec + 1);   // 前 k 根已经走完
+    const out = a.slice(0, k), b = a[k];
+    if (b && b.time < T) {                                       // 正在走的那根: 用小周期拼出来
+      const fine = this.fineBars(b.time);
+      const seg = fine.slice(lowerBound(fine, b.time), lowerBound(fine, T));
+      if (seg.length) {
+        let high = -Infinity, low = Infinity, value = 0;
+        for (const f of seg) { if (f.high > high) high = f.high; if (f.low < low) low = f.low; value += f.value; }
+        out.push({time: b.time, open: seg[0].open, close: seg[seg.length - 1].close, high, low, value});
       }
-      break;
     }
     return out;
   }
@@ -543,8 +556,14 @@ class Pane {
     if (this.replayed()) {
       const cut = this.cutBars(replayT);
       if (!cut.length) return;
+      const old = this.bars, n = cut.length;
+      const sameHead = old !== this.all && old.length && (old.length === n || old.length === n - 1)
+        && old[0] === cut[0] && old[n - 2] === cut[n - 2];
       this.bars = cut;
-      this.applyData();
+      if (sameHead && n >= 2) {                      // 前面都没变(时间只往前走了一点): 只更新最后一根, 快很多
+        this.candle.update(cut[n - 1]);
+        this.vol.update(this.volBar(cut[n - 1]));
+      } else this.applyData();
       this.pin();
       this.showLegend(this.bars[this.bars.length - 1]);
     } else {
@@ -674,12 +693,12 @@ if (chan) chan.onmessage = e => {
   if (active) { active.el.classList.remove('active'); active = null; }   // 用户在别的窗口操作, 本窗口只跟随
   fromRemote = true;
   try {
-    if (m.t === 'range') panes.forEach(p => p.bars.length && p.centerOn(m.c));
+    if (m.t === 'range') nextFrame('remoteRange', () => panes.forEach(p => p.bars.length && p.centerOn(m.c)));
     else if (m.t === 'cross') panes.forEach(p => p.bars.length && p.followCross(m.time, m.sec));
     else if (m.t === 'clear') panes.forEach(p => p.bars.length && p.clearCross());
     else if (m.t === 'sym' && normSym(m.s) !== symbol) openSymbol(m.s);
     else if (m.t === 'replay') {
-      if (m.on) { replayT = m.T; replayIv = m.iv; if (!replay) setReplay(true, true); else refreshReplay(); }
+      if (m.on) { replayT = m.T; replayIv = m.iv; if (!replay) setReplay(true, true); else nextFrame('replay', refreshReplay); }
       else if (replay) setReplay(false, true);
     }
     else if (m.t === 'close') { if (WIN > 0) window.close(); else if (TF.length) location.replace(pageUrl(null)); }
