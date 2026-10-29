@@ -538,15 +538,21 @@ class Pane {
     const need = replayT - w * this.sec;
     if (!this.all.length || this.all[0].time <= need || this.exhausted) return false;
     if (this.ensuring) return true;
+    if (Date.now() < (this.ensureRetryAt || 0)) return false;   // 刚失败过(断网等): 5秒内不再试, 免得一直狂刷
     this.ensuring = true;
     setStatus(`加载更早的${LABEL[this.iv]}K线...`);
     (async () => {
-      let k = 0;
+      let k = 0, failed = false;
       while (this.all[0].time > need && !this.exhausted && k++ < MAX_PAGES) {
-        if (!(await this.loadOlder())) break;
+        if (this.loading) {                          // 别的地方(提前预加载)正在加载: 等它完成, 不能原地空转(会卡死网页)
+          await new Promise(r => setTimeout(r, 100));
+          continue;
+        }
+        if (!(await this.loadOlder())) { failed = !this.exhausted; break; }
       }
       this.ensuring = false;
-      if (replay) { this.applyReplay(); setStatus('⏸ 固定时间: ' + fmtTime(replayT) + '  (往右拖最小周期, 时间往后走)'); }
+      if (failed) this.ensureRetryAt = Date.now() + 5000;
+      if (replay) nextFrame('replay', () => { refreshReplay(); });
     })();
     return true;
   }
