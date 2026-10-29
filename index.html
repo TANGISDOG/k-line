@@ -69,6 +69,13 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
 .chart.nearline, .chart.nearline *{cursor:ns-resize!important}
 .band{position:absolute;top:0;display:none;pointer-events:none;z-index:3;background:rgba(240,185,11,.13);border-left:1px solid rgba(240,185,11,.6);border-right:1px solid rgba(240,185,11,.6)}
 #star{padding:4px 7px;color:var(--muted)}
+.symwrap{position:relative;display:inline-block}
+#symlist{position:absolute;top:100%;left:0;margin-top:2px;z-index:60;min-width:100%;max-height:340px;overflow:auto;background:var(--panel);
+  border:1px solid var(--line);border-radius:4px;box-shadow:0 8px 20px rgba(0,0,0,.5)}
+#symlist[hidden]{display:none}
+#symlist div{padding:4px 10px;cursor:pointer;white-space:nowrap}
+#symlist div.on,#symlist div:hover{background:rgba(240,185,11,.15);color:var(--accent)}
+#symlist .none{color:var(--muted);cursor:default}
 #star.on{color:var(--accent);border-color:var(--accent)}
 #favbtn.on{border-color:var(--accent);color:var(--accent)}
 .mlabel .favbtn{pointer-events:auto;cursor:pointer;display:inline-block;margin-top:4px;padding:1px 8px;border:1px solid var(--accent);border-radius:3px;color:var(--accent)}
@@ -76,7 +83,7 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
 .mlabel .bmtag{color:var(--accent);margin-bottom:2px;max-width:260px;overflow:hidden;text-overflow:ellipsis}
 #main{flex:1;display:flex;min-height:0}
 #main #grid{flex:1;min-width:0}
-#favpanel{flex:none;width:420px;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+#favpanel{flex:none;width:540px;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
 @media (max-width:1100px){#favpanel{position:fixed;top:0;right:0;bottom:0;max-width:100vw;z-index:50;box-shadow:-8px 0 24px rgba(0,0,0,.45)}}
 #favpanel[hidden]{display:none}
 .fp-head{display:flex;align-items:center;gap:4px;padding:8px 10px;border-bottom:1px solid var(--line)}
@@ -114,6 +121,7 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
 #fp-table td.nm{cursor:pointer;font-weight:600}
 #fp-table td.nm:hover{color:var(--accent)}
 #fp-table .up{color:var(--up)}#fp-table .down{color:var(--down)}
+#fp-table td.big{color:#b7bdc6}
 #fp-table select{padding:1px 2px;font-size:12px;max-width:72px}
 .x{cursor:pointer;color:var(--muted);padding:0 4px}.x:hover{color:var(--down)}
 .seg{border:1px solid var(--line);border-radius:6px;padding:7px 9px;margin-bottom:7px;cursor:pointer;line-height:1.6}
@@ -128,7 +136,7 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
 <body>
 <header>
   <b>多周期联动</b><span id="src" style="color:var(--muted);font-size:12px"></span>
-  <input id="sym" placeholder="合约,如 AIN" autocomplete="off">
+  <span class="symwrap"><input id="sym" placeholder="币安合约,如 AIN" autocomplete="off" spellcheck="false"><div id="symlist" hidden></div></span>
   <button id="star" title="收藏/取消收藏当前合约">☆</button>
   <button id="go">打开</button>
   <button id="favbtn" title="收藏的合约(带价格/涨跌幅/分组)和收藏的K线段(点一下三个周期一起跳过去)">⭐ 收藏</button>
@@ -167,7 +175,8 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
     </div>
     <div class="fp-hint">分组: 拖动可以调顺序 · 鼠标移上去点 × 删除 · 双击改名 · 把合约那一行拖到分组上 = 移到那个组<br>点合约名打开 · 点表头排序(再点一次反过来) · "今日"=从UTC 0点(北京时间8点)开盘算起</div>
     <table id="fp-table"><thead><tr>
-      <th data-k="s">合约</th><th data-k="price">最新价</th><th data-k="chg24">24小时</th><th data-k="chgUtc">今日UTC</th><th></th>
+      <th data-k="s">合约</th><th data-k="price">最新价</th><th data-k="chg24">24小时</th><th data-k="chgUtc">今日UTC</th>
+      <th data-k="oiv" title="全部持仓的价值 = 持仓量 × 最新价">持仓价值</th><th data-k="mcap" title="市值 = 流通量 × 最新价 (数据来自币安; 少数合约没有)">市值</th><th></th>
     </tr></thead><tbody></tbody></table>
   </div>
   <div class="fp-body" id="fp-seg" hidden>
@@ -354,6 +363,7 @@ function makePxFmt(price) {
   return {type: 'price', precision: prec, minMove: Math.pow(10, -prec)};
 }
 function fmtVol(v) {
+  if (v >= 1e12) return (v / 1e12).toFixed(2) + 'T';
   if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
   if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
   if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
@@ -544,7 +554,10 @@ class Pane {
     this.exhausted = false;
     this.measure = null;
     this.renderMeasure();
-    this.all = this.bars = await fetchKlines(this.iv);
+    const sym = symbol, iv = this.iv;
+    const bars = await fetchKlines(iv);
+    if (symbol !== sym || this.iv !== iv) return;      // 等数据时已经换了合约/周期: 这份作废(否则慢回来的旧合约会盖掉新的)
+    this.all = this.bars = bars;
     if (pxFmt) this.candle.applyOptions({priceFormat: pxFmt});
     this.applyData();
     const n = this.bars.length;
@@ -1048,9 +1061,14 @@ function openSymbol(raw) {
 async function openSymbol0(raw) {
   const s = normSym(raw);
   if (!s) return;
+  if (SYMS && !SYMS.has(s)) {                        // 只认币安U本位永续合约
+    setStatus(`币安合约里没有 ${s.replace(/USDT$/, '')}`, true);
+    $('sym').value = symbol.replace(/USDT$/, '');
+    return;
+  }
   if (s !== symbol) post({t: 'sym', s});
   symbol = s;
-  $('sym').value = s;
+  $('sym').value = s.replace(/USDT$/, '');
   store.set('symbol', s);
   loadLines();
   $('star').classList.toggle('on', favHas(s));
@@ -1063,8 +1081,10 @@ async function openSymbol0(raw) {
   setStatus(`加载 ${s}...`);
   try {
     const px = await apiGet('/fapi/v1/ticker/price', {symbol: s});   // 只为定价格小数位, 用最轻的接口
+    if (symbol !== s) return;                        // 又换了别的合约
     pxFmt = makePxFmt(+px.price);
     await Promise.all(panes.map(p => p.load()));
+    if (symbol !== s) return;
     fineCache.clear();
     loadOI();
     setStatus('');
@@ -1265,6 +1285,9 @@ function favRow(s) {                                  // 合并: 快照(含UTC�
     r.chg24 = L.o ? (L.c / L.o - 1) * 100 : r.chg24;
     if (r.utcOpen) r.chgUtc = (L.c / r.utcOpen - 1) * 100;
   }
+  const px = L ? L.c : +r.price;
+  r.oiv = r.oiQty && px ? r.oiQty * px : null;                         // 持仓价值 = 持仓量 × 最新价
+  r.mcap = r.supply && px ? r.supply * px / (r.mult || 1) : null;      // 市值 = 流通量 × 最新价 (1000PEPE 这种除以1000)
   return r;
 }
 function connectFavWs() {
@@ -1291,7 +1314,7 @@ function closeFavWs() {
 function favLiveTick() {                              // 每秒: 只改数字, 不重建表格(不打断点击/下拉框)
   if ($('favpanel').hidden || favTab !== 'sym') return;
   const busy = document.activeElement && document.activeElement.closest('#fp-table select');
-  if (!busy && !mouseDown && !dragSym && !dragGroup && Date.now() - favSortAt > 5000 && ['price', 'chg24', 'chgUtc'].includes(favSort.k)) {
+  if (!busy && !mouseDown && !dragSym && !dragGroup && Date.now() - favSortAt > 5000 && ['price', 'chg24', 'chgUtc', 'oiv', 'mcap'].includes(favSort.k)) {
     favSortAt = Date.now(); renderFavTable(); return;  // 每5秒按最新数字重新排序
   }
   for (const tr of $('fp-table').tBodies[0].rows) {
@@ -1300,6 +1323,9 @@ function favLiveTick() {                              // 每秒: 只改数字, �
     const r = favRow(s), c = tr.cells;
     if (c[1].textContent !== r.price) c[1].textContent = r.price;
     setPct(c[2], r.chg24); setPct(c[3], r.chgUtc);
+    const ov = r.oiv != null ? fmtVol(r.oiv) : '-', mv = r.mcap != null ? fmtVol(r.mcap) : '-';
+    if (c[4].textContent !== ov) c[4].textContent = ov;
+    if (c[5].textContent !== mv) c[5].textContent = mv;
   }
 }
 function setPct(td, v) {
@@ -1378,11 +1404,11 @@ function renderFavTable() {
   });
   const opts = g => favs.groups.map(x => `<option${x === g ? ' selected' : ''}>${esc(x)}</option>`).join('');
   $('fp-table').tBodies[0].innerHTML = rows.map(r => `<tr class="${r.s === symbol ? 'cur' : ''}" data-s="${r.s}">
-    <td class="nm">${r.s.replace(/USDT$/, '')}<span style="color:var(--muted);font-weight:normal">${r.s.endsWith('USDT') ? '/USDT' : ''}</span></td>
+    <td class="nm">${r.s.replace(/USDT$/, '')}</td>
     <td>${r.missing ? '<span style="color:var(--muted)">已下架?</span>' : r.price != null ? r.price : '…'}</td>
-    ${pctCell(r.chg24)}${pctCell(r.chgUtc)}
+    ${pctCell(r.chg24)}${pctCell(r.chgUtc)}<td class="big">${r.oiv != null ? fmtVol(r.oiv) : '-'}</td><td class="big">${r.mcap != null ? fmtVol(r.mcap) : '-'}</td>
     <td><select data-s="${r.s}" title="移到别的分组">${opts(r.g)}</select><span class="x" data-del="${r.s}" title="取消收藏">✕</span></td>
-  </tr>`).join('') || `<tr><td colspan="5" style="color:var(--muted);text-align:left;padding:14px 4px">还没有收藏${favGroup !== '全部' ? '(这个分组)' : ''}。点"+ 收藏当前合约", 或合约输入框旁边的 ☆</td></tr>`;
+  </tr>`).join('') || `<tr><td colspan="7" style="color:var(--muted);text-align:left;padding:14px 4px">还没有收藏${favGroup !== '全部' ? '(这个分组)' : ''}。点"+ 收藏当前合约", 或合约输入框旁边的 ☆</td></tr>`;
 }
 async function fetchWatch() {                        // 收藏合约的最新价/24小时/UTC今日涨跌幅
   const syms = favs.items.map(x => x.s);
@@ -1641,9 +1667,52 @@ drawSwatches();
 setLayout(store.get('layout', 'cols'));
 setScale(logScale);
 $('scale').onclick = () => setScale(!logScale);
-$('go').onclick = () => openSymbol($('sym').value);
+// ---- 搜索框: 只能选币安U本位永续合约; 边打字边提示 ----
+let SYMS = null, symHits = [], symSel = 0;
+async function loadSymbols() {
+  try {
+    const list = LOCAL ? await (await fetch('/api/symbols', {cache: 'no-store'})).json()
+      : (await apiGet('/fapi/v1/exchangeInfo', {})).symbols
+          .filter(x => x.contractType === 'PERPETUAL' && x.quoteAsset === 'USDT' && x.status === 'TRADING').map(x => x.symbol);
+    if (Array.isArray(list) && list.length) SYMS = new Set(list);
+  } catch {}
+}
+function showSymList() {
+  const q = normSym($('sym').value).replace(/USDT$/, '');
+  if (!SYMS || !q) { $('symlist').hidden = true; return; }
+  const all = [...SYMS].map(x => x.replace(/USDT$/, ''));
+  const starts = all.filter(x => x.startsWith(q)).sort((a, b) => a.length - b.length || a.localeCompare(b));
+  const inside = all.filter(x => !x.startsWith(q) && x.includes(q)).sort();
+  symHits = starts.concat(inside).slice(0, 15);
+  symSel = 0;
+  $('symlist').innerHTML = symHits.length
+    ? symHits.map((x, i) => `<div data-s="${esc(x)}" class="${i === 0 ? 'on' : ''}">${esc(x)}</div>`).join('')
+    : `<div class="none">币安合约里没有 "${esc(q)}"</div>`;
+  $('symlist').hidden = false;
+}
+function pickSym(x) { $('symlist').hidden = true; openSymbol(x); $('sym').blur(); }
+$('sym').addEventListener('input', showSymList);
 $('sym').addEventListener('focus', e => e.target.select());
-$('sym').addEventListener('keydown', e => { if (e.key === 'Enter') openSymbol($('sym').value); });
+$('sym').addEventListener('blur', () => setTimeout(() => { $('symlist').hidden = true; }, 150));
+$('sym').addEventListener('keydown', e => {
+  const open = !$('symlist').hidden && symHits.length;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (!open) return;
+    e.preventDefault();
+    symSel = (symSel + (e.key === 'ArrowDown' ? 1 : -1) + symHits.length) % symHits.length;
+    [...$('symlist').children].forEach((d, i) => d.classList.toggle('on', i === symSel));
+    $('symlist').children[symSel].scrollIntoView({block: 'nearest'});
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    // 开提示里高亮的那个(打的正好是一个合约时它就排第一); 没有提示就按打的字开(不是币安合约会提示)
+    pickSym(open ? symHits[symSel] : $('sym').value);
+  } else if (e.key === 'Escape') { $('symlist').hidden = true; }
+});
+$('symlist').addEventListener('mousedown', e => {   // mousedown: 比输入框失焦先到
+  const d = e.target.closest('[data-s]');
+  if (d) { e.preventDefault(); pickSym(d.dataset.s); }
+});
+$('go').onclick = () => { const typed = normSym($('sym').value); pickSym(!SYMS || SYMS.has(typed) || !symHits.length ? $('sym').value : symHits[0]); };
 $('layout').onclick = () => setLayout($('grid').className === 'cols' ? 'rows' : 'cols');
 $('latest').onclick = () => {
   panes.forEach(p => {
@@ -1655,7 +1724,10 @@ $('latest').onclick = () => {
   if (replay) setTimeout(() => setReplay(true), 150);   // 固定时间模式: 当前时间回到最新
 };
 const q = URLQ.get('symbol') || location.hash.slice(1);
-openSymbol(q || store.get('symbol', 'BTCUSDT'));
+loadSymbols().then(() => {
+  const first = normSym(q || store.get('symbol', 'BTCUSDT'));
+  openSymbol(!SYMS || SYMS.has(first) ? first : 'BTCUSDT');
+});
 </script>
 </body>
 </html>
