@@ -85,9 +85,22 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
 .fp-head #fpclose{margin-left:auto;padding:2px 9px}
 .fp-body{flex:1;overflow:auto;padding:8px 10px}
 .fp-groups{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
-.fp-groups span{padding:2px 10px;border:1px solid var(--line);border-radius:12px;cursor:pointer;color:var(--muted);user-select:none}
+.fp-groups span{padding:2px 9px;border:1px solid var(--line);border-radius:12px;cursor:pointer;color:var(--muted);user-select:none;white-space:nowrap}
 .fp-groups span.on{border-color:var(--accent);color:var(--accent)}
 .fp-groups span i{font-style:normal;opacity:.6;margin-left:3px}
+.fp-groups span[data-drag=true]{cursor:grab;touch-action:none}
+.drag-ghost{position:fixed;z-index:100;pointer-events:none;background:var(--panel);border:1px solid var(--accent);color:var(--accent);
+  border-radius:12px;padding:2px 10px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.5)}
+.fp-groups span.dragging{opacity:.35}
+.fp-groups span.drop-l{box-shadow:-3px 0 0 var(--accent)}
+.fp-groups span.drop-r{box-shadow:3px 0 0 var(--accent)}
+.fp-groups span.drop-in{background:rgba(240,185,11,.2);border-color:var(--accent);color:var(--accent)}
+.fp-groups .del{visibility:hidden;font-weight:normal;margin:0 -4px 0 4px;padding:0 3px;border-radius:50%;color:var(--muted)}
+.fp-groups span:hover .del{visibility:visible}
+.fp-groups .del:hover{color:#fff;background:var(--down)}
+#fp-table tbody td.nm{cursor:grab}
+#fp-table tbody{user-select:none}
+#fp-table tbody tr.dragging td{opacity:.4}
 .fp-tools{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap}
 .fp-tools button{padding:3px 8px}
 .fp-hint{color:var(--muted);font-size:12px;margin:6px 0 10px;line-height:1.5}
@@ -152,7 +165,7 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
       <button id="fp-add">+ 收藏当前合约</button>
       <button id="fp-newgroup">+ 新分组</button>
     </div>
-    <div class="fp-hint">点合约名打开 · 点表头排序(再点一次反过来) · 右键分组可改名/删除 · "今日"=从UTC 0点(北京时间8点)开盘算起</div>
+    <div class="fp-hint">分组: 拖动可以调顺序 · 鼠标移上去点 × 删除 · 双击改名 · 把合约那一行拖到分组上 = 移到那个组<br>点合约名打开 · 点表头排序(再点一次反过来) · "今日"=从UTC 0点(北京时间8点)开盘算起</div>
     <table id="fp-table"><thead><tr>
       <th data-k="s">合约</th><th data-k="price">最新价</th><th data-k="chg24">24小时</th><th data-k="chgUtc">今日UTC</th><th></th>
     </tr></thead><tbody></tbody></table>
@@ -1278,7 +1291,7 @@ function closeFavWs() {
 function favLiveTick() {                              // 每秒: 只改数字, 不重建表格(不打断点击/下拉框)
   if ($('favpanel').hidden || favTab !== 'sym') return;
   const busy = document.activeElement && document.activeElement.closest('#fp-table select');
-  if (!busy && !mouseDown && Date.now() - favSortAt > 5000 && ['price', 'chg24', 'chgUtc'].includes(favSort.k)) {
+  if (!busy && !mouseDown && !dragSym && !dragGroup && Date.now() - favSortAt > 5000 && ['price', 'chg24', 'chgUtc'].includes(favSort.k)) {
     favSortAt = Date.now(); renderFavTable(); return;  // 每5秒按最新数字重新排序
   }
   for (const tr of $('fp-table').tBodies[0].rows) {
@@ -1312,7 +1325,7 @@ async function syncFavs() {                          // 从Mac取最新的收藏
     const r = await fetch('/api/kv?key=favs', {cache: 'no-store'});
     if (!r.ok) return;
     const v = await r.json();
-    if (Date.now() - favsSavedAt < 3000) return;
+    if (Date.now() - favsSavedAt < 3000 || dragGroup || dragSym) return;
     if (v == null) { if (favs.items.length || favs.segs.length) saveFavs(); return; }   // Mac上还没有: 把本浏览器的传上去
     const nv = normFavs(v);
     if (JSON.stringify(nv) === JSON.stringify(favs)) return;
@@ -1342,7 +1355,8 @@ function renderFavGroups() {
   if (favGroup !== '全部' && !favs.groups.includes(favGroup)) favGroup = '全部';
   const cnt = g => favs.items.filter(x => g === '全部' || x.g === g).length;
   $('fp-groups').innerHTML = ['全部', ...favs.groups].map(g =>
-    `<span data-g="${esc(g)}" class="${g === favGroup ? 'on' : ''}">${esc(g)}<i>${cnt(g)}</i></span>`).join('');
+    `<span data-g="${esc(g)}" class="${g === favGroup ? 'on' : ''}" data-drag="${g !== '全部'}">${esc(g)}<i>${cnt(g)}</i>`
+    + (g === '全部' || g === '默认' ? '' : `<b class="del" title="删除这个分组">×</b>`) + `</span>`).join('');
 }
 const pctCell = v => v == null ? '<td>-</td>' : `<td class="${v >= 0 ? 'up' : 'down'}">${v >= 0 ? '+' : ''}${v.toFixed(2)}%</td>`;
 function renderFavTable() {
@@ -1451,32 +1465,106 @@ $('fp-newgroup').onclick = () => {
   favs.groups.push(g); favGroup = g; store.set('favGroup', g); saveFavs();
 };
 document.querySelectorAll('.fp-head .tab').forEach(x => x.onclick = () => setFavTab(x.dataset.tab));
+function deleteGroup(g) {                            // 空组直接删; 有合约的问一下, 合约移回"默认"
+  const n = favs.items.filter(x => x.g === g).length;
+  if (n && !confirm(`删除分组"${g}"? 里面的 ${n} 个合约会移到"默认"`)) return;
+  favs.groups = favs.groups.filter(x => x !== g);
+  favs.items.forEach(x => { if (x.g === g) x.g = '默认'; });
+  if (favGroup === g) favGroup = '全部';
+  saveFavs();
+}
+function renameGroup(g) {
+  if (g === '全部') return;
+  if (g === '默认') { alert('"默认"分组不能改名(可以拖动换位置)'); return; }
+  const n = prompt(`分组"${g}"改成什么名字?`, g);
+  const nn = (n || '').trim().slice(0, 20);
+  if (!nn || nn === g || nn === '全部') return;
+  if (favs.groups.includes(nn)) { alert(`已经有"${nn}"这个分组了`); return; }
+  favs.groups = favs.groups.map(x => x === g ? nn : x);
+  favs.items.forEach(x => { if (x.g === g) x.g = nn; });
+  if (favGroup === g) favGroup = nn;
+  saveFavs();
+}
 $('fp-groups').onclick = e => {
   const el = e.target.closest('[data-g]');
   if (!el) return;
+  if (Date.now() - dragJustEnded < 300) return;
+  if (e.target.closest('.del')) { deleteGroup(el.dataset.g); return; }
   favGroup = el.dataset.g; store.set('favGroup', favGroup);
-  renderFavGroups(); renderFavTable();
+  // 只挪高亮, 不重建按钮(重建了双击就失效)
+  document.querySelectorAll('#fp-groups [data-g]').forEach(x => x.classList.toggle('on', x.dataset.g === favGroup));
+  renderFavTable();
 };
-$('fp-groups').oncontextmenu = e => {                // 右键分组: 改名 / 删除
+$('fp-groups').ondblclick = e => { const el = e.target.closest('[data-g]'); if (el) renameGroup(el.dataset.g); };
+$('fp-groups').oncontextmenu = e => {                // 右键也能改名(以前的用法)
   const el = e.target.closest('[data-g]');
   if (!el || el.dataset.g === '全部') return;
-  e.preventDefault();
-  const g = el.dataset.g;
-  if (g === '默认') { alert('"默认"分组不能改名或删除'); return; }
-  const n = prompt(`分组"${g}"改成什么名字? (清空后确定 = 删除这个分组, 里面的合约移到"默认")`, g);
-  if (n === null) return;
-  const nn = n.trim().slice(0, 20);
-  if (!nn) {
-    if (!confirm(`删除分组"${g}"?`)) return;
-    favs.groups = favs.groups.filter(x => x !== g);
-    favs.items.forEach(x => { if (x.g === g) x.g = '默认'; });
-  } else if (nn !== g && !favs.groups.includes(nn) && nn !== '全部') {
-    favs.groups = favs.groups.map(x => x === g ? nn : x);
-    favs.items.forEach(x => { if (x.g === g) x.g = nn; });
-    if (favGroup === g) favGroup = nn;
-  }
-  saveFavs();
+  e.preventDefault(); renameGroup(el.dataset.g);
 };
+// ---- 拖动: 分组左右换位置(像浏览器收藏夹栏); 合约那一行拖到分组上 = 移到那个组 ----
+// 用鼠标移动自己实现(不用浏览器自带拖放), 各浏览器/触屏表现一样
+let dragGroup = null, dragSym = null, dragGhost = null, dragJustEnded = 0;
+const clearDropMarks = () => document.querySelectorAll('.fp-groups span').forEach(x => x.classList.remove('drop-l', 'drop-r', 'drop-in', 'dragging'));
+const chipAt = (x, y) => { const el = document.elementFromPoint(x, y); return el && el.closest('#fp-groups [data-g]'); };
+function startDrag(e, kind, value, label, srcEl) {
+  const x0 = e.clientX, y0 = e.clientY;
+  let on = false;
+  const move = ev => {
+    if (!on) {
+      if (Math.hypot(ev.clientX - x0, ev.clientY - y0) < 5) return;   // 动了5像素才算拖, 否则还是点击
+      on = true;
+      if (kind === 'g') dragGroup = value; else dragSym = value;
+      srcEl.classList.add('dragging');
+      dragGhost = document.createElement('div');
+      dragGhost.className = 'drag-ghost';
+      dragGhost.textContent = label;
+      document.body.appendChild(dragGhost);
+    }
+    ev.preventDefault();
+    dragGhost.style.left = ev.clientX + 12 + 'px'; dragGhost.style.top = ev.clientY + 10 + 'px';
+    const el = chipAt(ev.clientX, ev.clientY);
+    document.querySelectorAll('.fp-groups span').forEach(x => x !== el && x.classList.remove('drop-l', 'drop-r', 'drop-in'));
+    if (!el) return;
+    const g = el.dataset.g;
+    if (kind === 's') { el.classList.toggle('drop-in', g !== '全部'); return; }
+    if (g === value) return;
+    const r = el.getBoundingClientRect(), left = g !== '全部' && ev.clientX < r.left + r.width / 2;
+    el.classList.toggle('drop-l', left); el.classList.toggle('drop-r', !left);
+  };
+  const up = ev => {
+    removeEventListener('pointermove', move, true);
+    removeEventListener('pointerup', up, true);
+    if (!on) return;
+    dragJustEnded = Date.now();                       // 松手后紧跟的那次"点击"不算(免得切到分组/打开合约)
+    const el = chipAt(ev.clientX, ev.clientY), g = el && el.dataset.g;
+    if (el && kind === 's' && g !== '全部') {
+      const it = favs.items.find(x => x.s === value);
+      if (it && it.g !== g) { it.g = g; saveFavs(); }
+    } else if (el && kind === 'g' && g !== value) {
+      const after = el.classList.contains('drop-r');
+      const list = favs.groups.filter(x => x !== value);
+      list.splice(g === '全部' ? 0 : list.indexOf(g) + (after ? 1 : 0), 0, value);
+      favs.groups = list;
+      saveFavs();
+    }
+    dragGroup = dragSym = null;
+    if (dragGhost) { dragGhost.remove(); dragGhost = null; }
+    clearDropMarks();
+    document.querySelectorAll('#fp-table tr.dragging').forEach(x => x.classList.remove('dragging'));
+  };
+  addEventListener('pointermove', move, true);
+  addEventListener('pointerup', up, true);
+}
+$('fp-groups').addEventListener('pointerdown', e => {
+  const el = e.target.closest('[data-g]');
+  if (e.button !== 0 || !el || el.dataset.g === '全部' || e.target.closest('.del')) return;
+  startDrag(e, 'g', el.dataset.g, '分组: ' + el.dataset.g, el);
+});
+$('fp-table').addEventListener('pointerdown', e => {
+  const tr = e.target.closest('tbody tr[data-s]');
+  if (e.button !== 0 || !tr || e.target.closest('select, .x')) return;
+  startDrag(e, 's', tr.dataset.s, tr.dataset.s.replace(/USDT$/, '') + ' → 拖到上面的分组', tr);
+});
 $('fp-table').onclick = e => {
   const th = e.target.closest('th[data-k]');
   if (th) {
@@ -1487,7 +1575,7 @@ $('fp-table').onclick = e => {
   const del = e.target.closest('[data-del]');
   if (del) { favs.items = favs.items.filter(x => x.s !== del.dataset.del); saveFavs(); return; }
   const nm = e.target.closest('td.nm');
-  if (nm) openSymbol(nm.parentElement.dataset.s);
+  if (nm && Date.now() - dragJustEnded > 300) openSymbol(nm.parentElement.dataset.s);
 };
 $('fp-table').onchange = e => {
   const sel = e.target.closest('select[data-s]');
