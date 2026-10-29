@@ -77,7 +77,7 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
   <input id="sym" placeholder="合约,如 AIN" autocomplete="off">
   <button id="go">打开</button>
   <button id="layout">竖排</button>
-  <button id="latest">回到最新</button>
+  <button id="latest" title="所有周期一键回到最新时间/最新价格">⏭ 回到最新</button>
   <button id="scale">对数坐标</button>
   <button id="replay" title="复盘: 大周期只显示到最小周期画面最右边的时间, 往右拖最小周期, 大周期K线一点点长出来">⏸ 固定时间</button>
   <button id="dl" title="把当前合约各周期的历史K线一次下载到本机浏览器里, 以后看历史/复盘基本不用联网">⬇ 下载历史</button>
@@ -456,13 +456,28 @@ class Pane {
 
   async changeInterval(iv) {
     const lr = active && active !== this && active.ts.getVisibleLogicalRange();
+    // 记住本窗口最右边的时间: 换周期后最右边还是这个时间(原来就在最新的, 换完也在最新)
+    const own = this.bars.length && this.ts.getVisibleLogicalRange();
+    const keepT = own && own.to < this.bars.length - 1 ? this.timeAt(own.to) : null;
+    const keepW = own ? own.to - own.from : INIT_BARS;
     this.iv = iv;
     if (!TF.length) store.set('ivs', panes.map(p => p.iv));   // 拆出来的窗口不改主窗口记住的周期
     setStatus(`加载 ${LABEL[iv]}...`);
     try { await this.load(); setStatus(''); } catch (e) { setStatus('加载失败: ' + e.message, true); return; }
     if (replay) { setReplay(true); connectWs(); return; }
-    if (lr) this.centerOn(active.timeAt((lr.from + lr.to) / 2));
+    if (keepT != null) await this.showRightAt(keepT, keepW);
+    else if (lr) this.centerOn(active.timeAt((lr.from + lr.to) / 2));
     connectWs();
+  }
+
+  async showRightAt(T, w) {                         // 把时间 T 放到最右边, 显示 w 根; 历史不够先往前补
+    let k = 0;
+    while (this.all[0].time > T - w * this.sec && !this.exhausted && k++ < MAX_PAGES) {
+      if (this.loading) { await new Promise(r => setTimeout(r, 100)); continue; }
+      if (!(await this.loadOlder())) break;
+    }
+    const to = this.indexOf(T);
+    this.ts.setVisibleLogicalRange({from: to - w, to});
   }
 
   // 往前加载一页更早的K线,并保持画面不跳
@@ -956,8 +971,41 @@ if (chan) chan.onmessage = e => {
 // ---- 横线标记: 每个合约各自一组, 存在本浏览器里, 所有周期/窗口都显示 ----
 const LINE_COLORS = ['#f0b90b', '#f6465d', '#0ecb81', '#3b82f6', '#c084fc', '#e6e8ea'];
 let hlines = [], selLine = null, drawMode = false, lineColor = store.get('lineColor', LINE_COLORS[0]);
-function loadLines() { hlines = symbol ? store.get('lines_' + symbol, []) : []; selLine = null; renderLines(); }
-function saveLines() { store.set('lines_' + symbol, hlines.map(l => ({id: l.id, p: l.p, c: l.c}))); post({t: 'lines', s: symbol}); }
+// 通过Mac打开(:8899)时, 横线存在Mac上, Mac和Windows看到的是同一套; 本浏览器里也留一份, Mac连不上时先用它
+let linesSavedAt = 0;
+const plainLines = () => hlines.map(l => ({id: l.id, p: l.p, c: l.c}));
+function loadLines() {
+  hlines = symbol ? store.get('lines_' + symbol, []) : []; selLine = null; renderLines();
+  syncLines();
+}
+async function syncLines() {                         // 从Mac取最新的线(别的电脑可能刚改过)
+  const s = symbol;
+  if (!LOCAL || !s) return;
+  try {
+    const r = await fetch('/api/lines?symbol=' + s, {cache: 'no-store'});
+    if (!r.ok) return;
+    const v = await r.json();
+    if (s !== symbol || mouseDown || Date.now() - linesSavedAt < 3000) return;   // 正在拖线/刚保存过: 以本地为准
+    if (JSON.stringify(v) === JSON.stringify(plainLines())) return;
+    hlines = v;
+    store.set('lines_' + s, v);
+    if (!hlines.some(l => l.id === selLine)) selLine = null;
+    renderLines();
+  } catch {}
+}
+function saveLines() {
+  const v = plainLines();
+  store.set('lines_' + symbol, v);
+  post({t: 'lines', s: symbol});
+  if (!LOCAL) return;
+  linesSavedAt = Date.now();
+  fetch('/api/lines', {method: 'POST', headers: {'Content-Type': 'application/json'}, keepalive: true,
+    body: JSON.stringify({symbol, lines: v})})
+    .then(r => { if (!r.ok) throw new Error(r.status); })
+    .catch(e => setStatus('横线保存到Mac失败(只存在本浏览器): ' + e.message, true));
+}
+setInterval(() => { if (!document.hidden) syncLines(); }, 15000);
+addEventListener('focus', () => syncLines());
 function renderLines() {
   panes.forEach(q => {
     q.plines.forEach(pl => q.candle.removePriceLine(pl));
