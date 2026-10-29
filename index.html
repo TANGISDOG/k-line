@@ -61,6 +61,12 @@ a:hover{color:var(--accent)}
 body.measuring .chart{cursor:crosshair}
 #measure.on,#replay.on{border-color:var(--accent);color:var(--accent)}
 #replay.on{background:rgba(240,185,11,.12)}
+#hline.on{border-color:var(--accent);color:var(--accent)}
+#colors{display:inline-flex;gap:4px;align-items:center}
+#colors i{width:14px;height:14px;border-radius:50%;cursor:pointer;border:2px solid transparent;box-sizing:border-box}
+#colors i.sel{border-color:#fff}
+body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
+.chart.nearline, .chart.nearline *{cursor:ns-resize!important}
 .band{position:absolute;top:0;display:none;pointer-events:none;z-index:3;background:rgba(240,185,11,.13);border-left:1px solid rgba(240,185,11,.6);border-right:1px solid rgba(240,185,11,.6)}
 @media (max-width:900px){#grid.cols{grid-auto-flow:row;grid-auto-rows:minmax(260px,1fr);grid-auto-columns:auto}#grid{overflow:auto}}
 </style>
@@ -76,6 +82,9 @@ body.measuring .chart{cursor:crosshair}
   <button id="replay" title="复盘: 大周期只显示到最小周期画面最右边的时间, 往右拖最小周期, 大周期K线一点点长出来">⏸ 固定时间</button>
   <button id="dl" title="把当前合约各周期的历史K线一次下载到本机浏览器里, 以后看历史/复盘基本不用联网">⬇ 下载历史</button>
   <button id="measure" title="打开后直接拖动就是测量; 不打开时按住Shift拖动也能测量; Esc清除">📏 测量</button>
+  <button id="hline" title="点一下按钮, 再在K线图上点一下 = 在那个价格画一条横线(所有周期都显示)&#10;拖动横线 = 移动; 点一下横线 = 选中, 再点颜色改色, 按 Delete 删除; 右键横线 = 删除">➖ 画线</button>
+  <span id="colors" title="横线颜色"></span>
+  <button id="clrlines" title="删除这个合约的所有横线">清除线</button>
   <select id="split" title="拆成几个独立窗口(各窗口同步)">
     <option value="1">1个窗口</option><option value="2">拆成2个窗口</option><option value="3">拆成3个窗口</option>
   </select>
@@ -296,6 +305,51 @@ class Pane {
     box.append(this.mEl, this.mLabel);
     this.measure = null;                     // {a: 开始时间, b: 结束时间}
     this.box = box;
+    // 横线: 画线模式下点一下 = 新线; 靠近已有横线按下 = 拖动它 / 点一下选中; 右键 = 删除
+    this.plines = new Map();                 // 线id -> 图上的 PriceLine
+    const relY = e => e.clientY - box.getBoundingClientRect().top;
+    const wantLine = e => e.button === 0 && !e.shiftKey && !measureMode && this.bars.length && (drawMode || this.lineAt(relY(e)));
+    box.addEventListener('mousedown', e => { if (wantLine(e)) { e.stopImmediatePropagation(); e.preventDefault(); } }, true);
+    box.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || e.shiftKey || measureMode) return;
+      if (!wantLine(e)) { if (selLine) selectLine(null); return; }
+      e.stopImmediatePropagation(); e.preventDefault();
+      let ln = drawMode ? null : this.lineAt(relY(e));
+      if (!ln) {
+        const p = this.candle.coordinateToPrice(relY(e));
+        if (p == null || !(p > 0)) return;
+        ln = {id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5), p, c: lineColor};
+        hlines.push(ln);
+        setDrawMode(false);                  // 画一条就自动退出, 免得拖图时误画
+        renderLines();
+        selectLine(ln.id);
+        saveLines();
+      }
+      const y0 = e.clientY;
+      let moved = false;
+      const move = ev => {
+        if (!moved && Math.abs(ev.clientY - y0) < 3) return;
+        moved = true;
+        const p = this.candle.coordinateToPrice(relY(ev));
+        if (p == null || !(p > 0)) return;
+        ln.p = p;
+        panes.forEach(q => { const pl = q.plines.get(ln.id); pl && pl.applyOptions({price: p}); });
+      };
+      const up = () => {
+        removeEventListener('pointermove', move, true);
+        removeEventListener('pointerup', up, true);
+        if (moved) saveLines(); else selectLine(ln.id);
+      };
+      addEventListener('pointermove', move, true);
+      addEventListener('pointerup', up, true);
+    }, true);
+    box.addEventListener('pointermove', e => { if (!mouseDown) box.classList.toggle('nearline', !drawMode && !measureMode && !!this.lineAt(relY(e))); }, {passive: true});
+    box.addEventListener('contextmenu', e => {
+      const ln = this.lineAt(relY(e));
+      if (!ln) return;
+      e.preventDefault();
+      deleteLine(ln.id);
+    });
     // 测量: 在图表接到事件之前截住(捕获阶段), 不让它变成平移
     const wantMeasure = e => (measureMode || e.shiftKey) && e.button === 0 && this.bars.length;
     box.addEventListener('mousedown', e => { if (wantMeasure(e)) { e.stopPropagation(); e.preventDefault(); } }, true);
@@ -342,6 +396,17 @@ class Pane {
   }
 
   get sec() { return SEC[this.iv]; }
+
+  lineAt(y) {                                // 鼠标附近 5 像素内的横线
+    let best = null, bd = 6;
+    for (const ln of hlines) {
+      const ly = this.candle.priceToCoordinate(ln.p);
+      if (ly == null) continue;
+      const d = Math.abs(ly - y);
+      if (d < bd) { bd = d; best = ln; }
+    }
+    return best;
+  }
 
   volBar(b) { return {time: b.time, value: b.value, color: b.close >= b.open ? 'rgba(14,203,129,.35)' : 'rgba(246,70,93,.35)'}; }
   applyData() {
@@ -590,8 +655,8 @@ class Pane {
     const f = v => v.toFixed(pxFmt ? pxFmt.precision : 4);
     const chg = (b.close / b.open - 1) * 100, amp = b.low > 0 ? (b.high - b.low) / b.low * 100 : 0;
     const cls = chg >= 0 ? 'up' : 'down';
-    this.legendEl.innerHTML = `${fmtTime(b.time)}  开 ${f(b.open)} 高 ${f(b.high)} 低 ${f(b.low)} 收 <span class="${cls}">${f(b.close)}</span>`
-      + `  <span class="${cls}">${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>  振幅 ${amp.toFixed(2)}%  额 ${fmtVol(b.value)}`
+    this.legendEl.innerHTML = `${fmtTime(b.time)}  开 ${f(b.open)} 高 ${f(b.high)} 低 ${f(b.low)} 收 ${f(b.close)}`
+      + `  <span class="${cls}">涨跌 ${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</span>  <span style="color:#c084fc">振幅 ${amp.toFixed(2)}%</span>  <span style="color:#60a5fa">额 ${fmtVol(b.value)}</span>`
       + (() => { const v = this.oiForBar(b); return v == null ? '' : `  <span style="color:#f0b90b">仓 ${fmtVol(v)}</span>`; })();
   }
 
@@ -777,6 +842,7 @@ async function openSymbol(raw) {
   symbol = s;
   $('sym').value = s;
   store.set('symbol', s);
+  loadLines();
   document.title = `${s} 多周期联动` + (TF.length ? ` · ${TF.map(iv => LABEL[iv]).join('/')}` : '');
   $('lnk-tf').href = `https://www.tradeflow.club/analytics/smart-money-signal?symbol=${s}`;
   $('lnk-cg').href = `https://www.coinglass.com/tv/zh/Binance_${s}`;
@@ -878,6 +944,7 @@ if (chan) chan.onmessage = e => {
     else if (m.t === 'cross') panes.forEach(p => p.bars.length && p.followCross(m.time, m.sec));
     else if (m.t === 'clear') panes.forEach(p => p.bars.length && p.clearCross());
     else if (m.t === 'sym' && normSym(m.s) !== symbol) openSymbol(m.s);
+    else if (m.t === 'lines' && m.s === symbol) loadLines();
     else if (m.t === 'replay') {
       if (m.on) { replayT = m.T; replayIv = m.iv; if (!replay) setReplay(true, true); else nextFrame('replay', refreshReplay); }
       else if (replay) setReplay(false, true);
@@ -886,13 +953,57 @@ if (chan) chan.onmessage = e => {
   } finally { fromRemote = false; }
 };
 
+// ---- 横线标记: 每个合约各自一组, 存在本浏览器里, 所有周期/窗口都显示 ----
+const LINE_COLORS = ['#f0b90b', '#f6465d', '#0ecb81', '#3b82f6', '#c084fc', '#e6e8ea'];
+let hlines = [], selLine = null, drawMode = false, lineColor = store.get('lineColor', LINE_COLORS[0]);
+function loadLines() { hlines = symbol ? store.get('lines_' + symbol, []) : []; selLine = null; renderLines(); }
+function saveLines() { store.set('lines_' + symbol, hlines.map(l => ({id: l.id, p: l.p, c: l.c}))); post({t: 'lines', s: symbol}); }
+function renderLines() {
+  panes.forEach(q => {
+    q.plines.forEach(pl => q.candle.removePriceLine(pl));
+    q.plines.clear();
+    hlines.forEach(ln => q.plines.set(ln.id, q.candle.createPriceLine({price: ln.p, color: ln.c,
+      lineWidth: ln.id === selLine ? 2 : 1, lineStyle: ln.id === selLine ? LightweightCharts.LineStyle.Dashed : LightweightCharts.LineStyle.Solid,
+      axisLabelVisible: true, title: ''})));
+  });
+}
+function selectLine(id) {
+  selLine = id;
+  const ln = hlines.find(l => l.id === id);
+  if (ln) { lineColor = ln.c; drawSwatches(); }
+  renderLines();
+}
+function deleteLine(id) {
+  hlines = hlines.filter(l => l.id !== id);
+  if (selLine === id) selLine = null;
+  renderLines(); saveLines();
+}
+function setDrawMode(on) {
+  drawMode = on;
+  if (on && measureMode) setMeasureMode(false);
+  $('hline').classList.toggle('on', on);
+  document.body.classList.toggle('drawing', on);
+}
+function drawSwatches() {
+  $('colors').innerHTML = LINE_COLORS.map(c => `<i style="background:${c}" data-c="${c}" class="${c === lineColor ? 'sel' : ''}"></i>`).join('');
+}
+$('colors').onclick = e => {
+  const c = e.target.dataset && e.target.dataset.c;
+  if (!c) return;
+  lineColor = c; store.set('lineColor', c); drawSwatches();
+  const ln = hlines.find(l => l.id === selLine);
+  if (ln) { ln.c = c; renderLines(); saveLines(); }   // 选中了线 = 给它改色
+};
+
 function setMeasureMode(on) {
+  if (on && drawMode) setDrawMode(false);
   measureMode = on;
   $('measure').classList.toggle('on', on);
   document.body.classList.toggle('measuring', on);
 }
 addEventListener('keydown', e => {
-  if (e.key === 'Escape') panes.forEach(p => { p.measure = null; p.renderMeasure(); });
+  if (e.key === 'Escape') { panes.forEach(p => { p.measure = null; p.renderMeasure(); }); setDrawMode(false); if (selLine) selectLine(null); }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selLine && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); deleteLine(selLine); }
   if (e.key === 'Shift') document.body.classList.add('measuring');
 });
 addEventListener('keyup', e => { if (e.key === 'Shift' && !measureMode) document.body.classList.remove('measuring'); });
@@ -918,6 +1029,9 @@ $('merge').onclick = merge;
 $('replay').onclick = () => setReplay(!replay);
 $('dl').onclick = downloadHistory;
 $('measure').onclick = () => setMeasureMode(!measureMode);
+$('hline').onclick = () => setDrawMode(!drawMode);
+$('clrlines').onclick = () => { if (hlines.length && confirm(`删除 ${symbol} 的全部 ${hlines.length} 条横线?`)) { hlines = []; selLine = null; renderLines(); saveLines(); } };
+drawSwatches();
 setLayout(store.get('layout', 'cols'));
 setScale(logScale);
 $('scale').onclick = () => setScale(!logScale);
