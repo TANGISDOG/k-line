@@ -463,8 +463,18 @@ class Pane {
     this.iv = iv;
     if (!TF.length) store.set('ivs', panes.map(p => p.iv));   // 拆出来的窗口不改主窗口记住的周期
     setStatus(`加载 ${LABEL[iv]}...`);
+    const T0 = replayT;
+    if (replay) this.pinUntil = Infinity;            // 固定时间模式: 加载时画面会先到最新, 别让它改掉固定的时间
     try { await this.load(); setStatus(''); } catch (e) { setStatus('加载失败: ' + e.message, true); return; }
-    if (replay) { setReplay(true); connectWs(); return; }
+    finally { if (this.pinUntil === Infinity) this.pinUntil = 0; }
+    if (replay) {                                    // 固定时间不变, 基准换成现在最小的周期
+      replayT = T0;
+      replayIv = panes.slice().sort((a, b) => a.sec - b.sec)[0].iv;
+      post({t: 'replay', on: true, T: replayT, iv: replayIv});
+      refreshReplay();
+      connectWs();
+      return;
+    }
     if (keepT != null) await this.showRightAt(keepT, keepW);
     else if (lr) this.centerOn(active.timeAt((lr.from + lr.to) / 2));
     connectWs();
