@@ -169,8 +169,16 @@ body.drawing .chart, body.drawing .chart *{cursor:crosshair!important}
 const API = 'https://fapi.binance.com';
 const WS = 'wss://fstream.binance.com/market/stream?streams=';   // 币安2026年把行情推送挪到了 /market (旧地址能连上但不推数据)
 const TZ = -new Date().getTimezoneOffset() * 60;   // 图表库按UTC显示,整体平移成本地时间
-const SEC = {'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'12h':43200,'1d':86400};
-const LABEL = {'1m':'1分钟','3m':'3分钟','5m':'5分钟','15m':'15分钟','30m':'30分钟','1h':'1小时','2h':'2小时','4h':'4小时','6h':'6小时','12h':'12小时','1d':'1天'};
+const SEC = {'1m':60,'3m':180,'5m':300,'15m':900,'30m':1800,'1h':3600,'2h':7200,'4h':14400,'6h':21600,'12h':43200,'1d':86400,
+             '3d':259200,'1w':604800,'1M':2592000};   // 1月按30天估算, 真正的结束时间用 barEndOf
+const LABEL = {'1m':'1分钟','3m':'3分钟','5m':'5分钟','15m':'15分钟','30m':'30分钟','1h':'1小时','2h':'2小时','4h':'4小时','6h':'6小时','12h':'12小时','1d':'1天',
+               '3d':'3天','1w':'1周','1M':'1月'};
+// 一根K线的收盘时刻(t: 开盘时刻, 图表时间); 月线按自然月(28~31天), 其他固定长度
+function barEndOf(iv, t) {
+  if (iv !== '1M') return t + SEC[iv];
+  const d = new Date((t - TZ) * 1000);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000 + TZ;
+}
 const PAGE = 1500;
 const PREFETCH_BARS = 300;  // 离左边还剩多少根就提前加载更早的K线
 const frameJobs = new Map();
@@ -302,7 +310,7 @@ async function fetchKlines(iv, endTime) {
 
 // "⬇下载历史": 把当前合约各周期往前一段的K线都存到本地
 const DL_DAYS = {'1m': 7, '3m': 20, '5m': 60, '15m': 180, '30m': 365, '1h': 730, '2h': 730, '4h': 1460,
-                 '6h': 1460, '12h': 1460, '1d': 2000};
+                 '6h': 1460, '12h': 1460, '1d': 2000, '3d': 3000, '1w': 3000, '1M': 3000};
 async function downloadHistory() {
   const ivs = [...new Set(panes.map(p => p.iv).concat(replayIv ? [replayIv] : []))];
   const jobs = [];
@@ -464,6 +472,7 @@ class Pane {
   }
 
   get sec() { return SEC[this.iv]; }
+  barEnd(t) { return barEndOf(this.iv, t); }
 
   // 图表改画面要等到下一帧才生效, 这之前读到的还是旧画面; 记住刚设的, 读的时候以它为准
   setRange(r) {
@@ -495,7 +504,7 @@ class Pane {
   oiCandle(b) {
     if (!oiPts.length) return null;
     const start = (b.time - TZ) * 1000;
-    let end = start + this.sec * 1000;
+    let end = (this.barEnd(b.time) - TZ) * 1000;
     if (this.replayed() && replayT != null) end = Math.min(end, (replayT - TZ) * 1000);
     const upto = t => { let lo = 0, hi = oiPts.length - 1;           // 最后一个 <= t 的点
       if (oiPts[0][0] > t) return -1;
@@ -636,7 +645,7 @@ class Pane {
     if (replay) {
       if (this.replayed()) {                         // 大周期
         if (mouseDown || lastWheelPan) {             // 拖动/平移: 它的右边就是新的"当前时间", 其他周期跟着走
-          const T = Math.min(this.timeAt(Math.floor(lr.to)) + this.sec, Math.floor(Date.now() / 1000) + TZ);
+          const T = Math.min(this.barEnd(this.timeAt(Math.floor(lr.to))), Math.floor(Date.now() / 1000) + TZ);
           if (T !== replayT) {
             replayT = T;
             // 正在拖的这个先不重画(重画会挪动它的画面, 时间又跟着变, 越滚越远), 松手后再截好钉好
@@ -688,16 +697,16 @@ class Pane {
     this.showLegend(b || this.nowBar());
     for (const o of panes) {
       if (o === this || !o.bars.length) continue;
-      if (b) o.followCross(b.time, this.sec); else o.clearCross();
+      if (b) o.followCross(b.time, this.sec, this.barEnd(b.time)); else o.clearCross();
     }
-    post(b ? {t: 'cross', time: b.time, sec: this.sec} : {t: 'clear'});
+    post(b ? {t: 'cross', time: b.time, sec: this.sec, end: this.barEnd(b.time)} : {t: 'clear'});
   }
 
   // 别的窗口指到了时间 t(那根K线长 srcSec 秒): 本窗口光标对到同一时间;
   // 不在画面里就滚过去(还没加载就先往前加载); 比本窗口周期大的,把那一整段标亮
-  async followCross(t, srcSec) {
+  async followCross(t, srcSec, srcEnd) {
     this.crossT = t;
-    this.band = srcSec > this.sec ? {from: t, to: t + srcSec} : null;
+    this.band = srcSec > this.sec ? {from: t, to: srcEnd || t + srcSec} : null;
     if (t < this.bars[0].time && !this.exhausted && !replay && !mouseDown) {
       await this.centerOn(t);
       if (this.crossT !== t) return;
@@ -764,11 +773,11 @@ class Pane {
     for (const b of seg) { if (b.high > hi) hi = b.high; if (b.low < lo) lo = b.low; }
     const chg = (close / open - 1) * 100, amp = lo > 0 ? (hi - lo) / lo * 100 : 0;
     const vol = seg.reduce((a, b) => a + b.value, 0);
-    const secs = seg[seg.length - 1].time + this.sec - seg[0].time;
+    const secs = this.barEnd(seg[seg.length - 1].time) - seg[0].time;
     const d = Math.floor(secs / 86400), h = Math.floor(secs % 86400 / 3600), m = Math.floor(secs % 3600 / 60);
     const dur = (d ? d + '天' : '') + (h ? h + '小时' : '') + (m && !d ? m + '分' : '') || '0分';
     const up = chg >= 0, f = v => v.toFixed(pxFmt ? pxFmt.precision : 4);
-    this.mStats = {a: seg[0].time, end: seg[seg.length - 1].time + this.sec, chg, amp, n: seg.length};
+    this.mStats = {a: seg[0].time, end: this.barEnd(seg[seg.length - 1].time), chg, amp, n: seg.length};
     // 位置
     const half = this.ts.options().barSpacing / 2, w = this.ts.width();
     const a = this.ts.logicalToCoordinate(i0), z = this.ts.logicalToCoordinate(i1);
@@ -783,7 +792,7 @@ class Pane {
     lab.innerHTML = (bm ? `<div class="bmtag">⭐ ${LABEL[bm.iv] || bm.iv}收藏${bm.note ? ' · ' + esc(bm.note) : ''}</div>` : '')
       + `<span class="big ${up ? 'up' : 'down'}">${up ? '📈 +' : '📉 '}${chg.toFixed(2)}%</span>`
       + `&nbsp;&nbsp;振幅 <b>${amp.toFixed(2)}%</b><br>`
-      + `${fmtTime(seg[0].time)} → ${fmtTime(seg[seg.length - 1].time + this.sec)}<br>`
+      + `${fmtTime(seg[0].time)} → ${fmtTime(this.barEnd(seg[seg.length - 1].time))}<br>`
       + `<span class="dim">${dur} · ${seg.length}根K线</span><br>`
       + `<span class="dim">高 ${f(hi)}  低 ${f(lo)}  额 ${fmtVol(vol)}</span>`
       + (bm ? '' : `<br><span class="favbtn">⭐ 收藏这段</span>`);
@@ -844,7 +853,7 @@ class Pane {
 
   // 信息栏默认显示哪根: 平时是最新那根; 固定时间模式下基准周期显示"当前时间"那根(不剧透后面)
   nowBar() {
-    if (replay && replayT != null && !this.replayed()) return this.barAt(replayT - this.sec) || this.bars[this.bars.length - 1];
+    if (replay && replayT != null && !this.replayed()) return this.barAt(replayT - 1) || this.bars[this.bars.length - 1];
     return this.bars[this.bars.length - 1];
   }
 
@@ -854,12 +863,13 @@ class Pane {
   rightEdgeT() {                                    // 画面最右边那根K线的收盘时刻
     const lr = this.range(), n = this.all.length;
     const i = Math.max(0, Math.min(n - 1, Math.floor(lr ? lr.to : n - 1)));
-    return this.all[i].time + this.sec;
+    return this.barEnd(this.all[i].time);
   }
 
   // 截到时间 T: 走完的照常显示, 正在走的那根用小周期K线拼出 T 那一刻的样子
   cutBars(T) {
-    const a = this.all, k = lowerBound(a, T - this.sec + 1);   // 前 k 根已经走完
+    const a = this.all, j = lowerBound(a, T);                   // 前 j 根在 T 之前开盘
+    const k = j > 0 && this.barEnd(a[j - 1].time) > T ? j - 1 : j;   // 前 k 根已经走完(月线长短不一, 按真实收盘时刻算)
     const out = a.slice(0, k), b = a[k];
     if (b && b.time < T) {                                       // 正在走的那根: 用小周期拼出来
       const fine = this.fineBars(b.time);
@@ -880,7 +890,7 @@ class Pane {
     const key = `${symbol}|${replayIv}|${start}|${this.sec}`;
     if (fineCache.has(key)) return fineCache.get(key);
     fineCache.set(key, []);
-    const iv = replayIv, s0 = (start - TZ) * 1000, e0 = s0 + this.sec * 1000, pm = pageMs(iv);
+    const iv = replayIv, s0 = (start - TZ) * 1000, e0 = (this.barEnd(start) - TZ) * 1000, pm = pageMs(iv);
     (async () => {                                   // 按页取(和别的请求共用本地缓存), 不再每根K线单独请求
       const rows = [];
       for (let ps = Math.floor(s0 / pm) * pm; ps < e0; ps += pm) rows.push(...await getPage(iv, ps));
@@ -950,7 +960,7 @@ class Pane {
       // 基准周期右边还有"未来"的K线(往右拖才能前进), 把最新价那条线/标签藏起来, 信息栏显示当前时间那根
       this.candle.applyOptions({lastValueVisible: false, priceLineVisible: false});
       this.oi.applyOptions({lastValueVisible: false});
-      const b = this.barAt(replayT - this.sec);
+      const b = this.barAt(replayT - 1);
       if (b && this.crossT == null) this.showLegend(b);
     }
   }
@@ -1131,7 +1141,7 @@ if (chan) chan.onmessage = e => {
   fromRemote = true;
   try {
     if (m.t === 'range') nextFrame('remoteRange', () => panes.forEach(p => p.bars.length && p.centerOn(m.c)));
-    else if (m.t === 'cross') panes.forEach(p => p.bars.length && p.followCross(m.time, m.sec));
+    else if (m.t === 'cross') panes.forEach(p => p.bars.length && p.followCross(m.time, m.sec, m.end));
     else if (m.t === 'clear') panes.forEach(p => p.bars.length && p.clearCross());
     else if (m.t === 'sym' && normSym(m.s) !== symbol) openSymbol(m.s);
     else if (m.t === 'lines' && m.s === symbol) loadLines();
